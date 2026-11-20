@@ -1,0 +1,28 @@
+# ---- velike binarne mape (motor se pripravi z scripts/setup-engine.sh) ----
+engine/
+share/
+prefixes/
+apps/
+data/
+dist/
+wftest/
+
+# ---- binarne datoteke ----
+*.exe
+*.dll
+*.so
+*.tar
+*.tar.*
+*.zst
+*.zip
+*.7z
+*.msi
+*.iso
+
+# ---- ostalo ----
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+*.bak
+*.bak-*

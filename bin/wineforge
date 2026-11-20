@@ -1,0 +1,1933 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+WineForge — prenosni Wine motor za Linux
+========================================
+Ena mapa = celoten Windows okoljski sklad: Wine runtime, DXVK, VKD3D, CUDA
+(nvidia-libs), VC++/.NET/WebView2 komponente, predpripravljeni prefixi in
+orodja za pretvorbo namestitvenih programov v prenosne aplikacije.
+
+Vse poti so relativne na koren motorja (mapa, kjer je ta datoteka v bin/),
+zato motor deluje iz katerekoli lokacije, tudi z USB ključa.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+README_TXT = """Prenosni paket: {name}
+============================================================
+
+ZAGON
+  ./run.sh            (v terminalu, ali dvoklik na run.sh)
+
+  Prvi zagon lahko traja nekaj minut (Wine pripravi prefix).
+
+KAJ VSEBUJE
+  engine/wine          Wine 11.22 (64-bit + 32-bit, wow64)
+  engine/nvidia-libs   CUDA, NVML, NVAPI, NVENC, NvOptix (za NVIDIA GPU)
+  engine/tools         winetricks (offline predpomnilnik v share/verbs)
+  share/templates      predpripravljen osnovni prefix (VC++, .NET, WebView2, DXVK)
+  prefixes/{name}      prefix te aplikacije (nastavitve, podatki, shramba)
+  apps/{name}          program + njegove datoteke
+
+ZAHTEVE
+  64-bit Linux, glibc >= 2.31, Vulkan gonilnik (NVIDIA/AMD/Intel).
+  Priporoceno: NVIDIA gonilnik 580+ za CUDA pospesevanje.
+
+POMEMBNO — NE UBIVAJ APLIKACIJE NA SILO
+  Ce aplikacijo ubijes s 'kill -9' (ali ce se sesuje med pisanjem),
+  se lahko njeni podatki pokvarijo in okno ostane BELO.
+  Zapri jo z gumbom X ali Ctrl+Q.
+
+CE JE OKNO BELO / PRAZNO
+  ./bin/wineforge repair {name}          # ponastavi WebView2 profil
+  ./bin/wineforge repair {name} --restore  # obnovi podatke iz varnostne kopije
+
+DRUGI UKAZI
+  ./bin/wineforge list                  seznam aplikacij
+  ./bin/wineforge doctor                diagnoza (Wine, GPU, Vulkan, CUDA)
+  ./bin/wineforge run {name} --debug    zagon z izpisi
+  ./bin/wineforge prefix shell {name}   ukazna vrstica znotraj prefixa
+  ./bin/wineforge pack {name} --out .   naredi nov prenosni paket
+
+PRENOS NA DRUG RACUNALNIK
+  Kopiraj celotno mapo (npr. na USB). Poti so relativne, zato deluje
+  iz katerekoli lokacije. Ce kopiras na filesystem brez podpore za
+  trde povezave (FAT32), uporabi: rsync -a --no-hard-links
+"""
+
+
+# ---------------------------------------------------------------- poti ------
+
+FORGE = Path(os.environ.get("WINEFORGE_DIR") or Path(__file__).resolve().parent.parent)
+ENGINE = FORGE / "engine"
+WINE_DIR = ENGINE / "wine"
+WINE = WINE_DIR / "bin" / "wine"
+WINESERVER = WINE_DIR / "bin" / "wineserver"
+WINEBOOT = WINE_DIR / "bin" / "wineboot"
+WINE64 = WINE_DIR / "bin" / "wine64"
+NVLIBS = ENGINE / "nvidia-libs"
+TOOLS = ENGINE / "tools"
+SHARE = FORGE / "share"
+TEMPLATES = SHARE / "templates"
+DEPS = SHARE / "deps"
+APPS = FORGE / "apps"
+PREFIXES = FORGE / "prefixes"
+DATA = FORGE / "data"
+LOGS = DATA / "logs"
+
+BASE_TEMPLATE = TEMPLATES / "base-prefix.tar.zst"
+
+# --------------------------------------------------------------- pomožno ----
+
+
+def log(msg=""):
+    print(msg, flush=True)
+
+
+def step(msg):
+    print("\033[1;36m==>\033[0m " + msg, flush=True)
+
+
+def warn(msg):
+    print("\033[1;33m[!]\033[0m " + msg, flush=True)
+
+
+def err(msg):
+    print("\033[1;31m[x]\033[0m " + msg, flush=True)
+
+
+def die(msg, code=1):
+    err(msg)
+    sys.exit(code)
+
+
+def human(n):
+    for unit in ("B", "K", "M", "G", "T"):
+        if abs(n) < 1024 or unit == "T":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+
+
+def du(path):
+    total = 0
+    for root, _dirs, files in os.walk(path, followlinks=False):
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                if not os.path.islink(p):
+                    total += os.path.getsize(p)
+            except OSError:
+                pass
+    return total
+
+
+def run(cmd, env=None, check=False, capture=False, quiet=False):
+    """Zažene ukaz, vrne (koda, stdout)."""
+    if not quiet:
+        pass
+    e = os.environ.copy()
+    if env:
+        e.update({k: str(v) for k, v in env.items() if v is not None})
+    if capture:
+        p = subprocess.run(cmd, env=e, text=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT)
+        return p.returncode, p.stdout
+    p = subprocess.run(cmd, env=e)
+    if check and p.returncode:
+        die(f"Ukaz ni uspel ({p.returncode}): {' '.join(map(str, cmd))}")
+    return p.returncode, ""
+
+
+def slugify(name):
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", name.strip().lower()).strip("-")
+    return s or "app"
+
+
+# --------------------------------------------------------------- okolje -----
+
+DEFAULT_ENV = {
+    # tišina: fixme sporočila samo smetijo v konzolo
+    "WINEDEBUG": "-fixme-all",
+    # sinhronizacija niti (fsync je hitrejši, esync rezerva)
+    "WINEFSYNC": "1",
+    "WINEESYNC": "1",
+    # DXVK / VKD3D
+    "DXVK_LOG_LEVEL": "none",
+    "DXVK_STATE_CACHE": "1",
+    "DXVK_STATE_CACHE_PATH": None,          # nastavi se na prefix
+    "VKD3D_DEBUG": "none",
+    "DXVK_NVAPI_LOG_LEVEL": "none",
+    # CUDA/NVML iz nvidia-libs
+    "CUDA_FAKE_LUID": None,
+}
+
+
+def wine_env(prefix=None, extra=None, debug=False):
+    """Zgradi okolje za zagon Wine."""
+    env = dict(DEFAULT_ENV)
+    # vgrajene (bundlane) knjižnice imajo prednost
+    libdir = ENGINE / "lib"
+    if libdir.is_dir():
+        env["LD_LIBRARY_PATH"] = f"{libdir}:" + os.environ.get("LD_LIBRARY_PATH", "")
+    if prefix:
+        p = Path(prefix).expanduser().resolve()
+        env["WINEPREFIX"] = str(p)
+        env["DXVK_STATE_CACHE_PATH"] = str(p / "dxvk-cache")
+        (p / "dxvk-cache").mkdir(parents=True, exist_ok=True)
+    env["WINEARCH"] = "win64"
+    if debug:
+        env["WINEDEBUG"] = "+loaddll,+module"
+    if extra:
+        env.update({k: str(v) for k, v in extra.items() if v is not None})
+    # počisti None vrednosti (subprocess jih ne prenese)
+    return {k: str(v) for k, v in env.items() if v is not None}
+
+
+def wine(cmd, prefix=None, env=None, capture=False, debug=False, check=False):
+    """Zažene wine <cmd...>."""
+    full = [str(WINE)] + [str(c) for c in cmd]
+    return run(full, env=wine_env(prefix, env, debug), capture=capture, check=check)
+
+
+def wineserver_kill(prefix):
+    if WINESERVER.exists():
+        run([str(WINESERVER), "-k"], env=wine_env(prefix), capture=True)
+
+
+def wait_wineserver(prefix, timeout=30):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        code, _ = run([str(WINESERVER), "-w"], env=wine_env(prefix), capture=True)
+        if code == 0:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+# ------------------------------------------------------- registri/overrides --
+
+def reg_add(prefix, key, name, value, vtype="REG_SZ"):
+    code, out = wine(["reg", "add", key, "/v", name, "/t", vtype, "/d", value, "/f"],
+                     prefix=prefix, capture=True)
+    return code == 0
+
+
+def reg_delete(prefix, key, name):
+    wine(["reg", "delete", key, "/v", name, "/f"], prefix=prefix, capture=True)
+
+
+DLL_OVERRIDES = {
+    # DXVK (Direct3D 9/10/11 prek Vulkan)
+    "*d3d8": "native", "*d3d9": "native", "*d3d10core": "native",
+    "*d3d11": "native", "*dxgi": "native",
+    # VKD3D-Proton (Direct3D 12 prek Vulkan)
+    "*d3d12": "native", "*d3d12core": "native",
+    # CUDA / NVIDIA (nvidia-libs)
+    "nvcuda": "native", "nvml": "native", "nvapi64": "native",
+    "nvcuvid": "native", "nvencodeapi64": "native",
+}
+
+
+def apply_overrides(prefix, overrides=None):
+    ov = dict(DLL_OVERRIDES)
+    if overrides:
+        ov.update(overrides)
+    for dll, mode in ov.items():
+        reg_add(prefix, r"HKEY_CURRENT_USER\Software\Wine\DllOverrides", dll, mode)
+
+
+def link_nvidia_libs(prefix):
+    """Vpne nvcuda/nvml/nvapi iz engine/nvidia-libs v system32 (symlink + override)."""
+    if not NVLIBS.is_dir():
+        return False
+    sys32 = Path(prefix) / "drive_c" / "windows" / "system32"
+    sys32.mkdir(parents=True, exist_ok=True)
+    x64 = NVLIBS / "x64"
+    n = 0
+    # 64-bit: nvcuda/nvml/... so ELF winelib -> symlink + override native
+    for dll in ("nvcuda.dll", "nvml.dll", "nvoptix.dll", "nvcuvid.dll",
+                "nvencodeapi64.dll", "nvofapi64.dll", "nvapi64.dll"):
+        src = x64 / dll
+        if src.exists():
+            dst = sys32 / dll
+            if dst.is_symlink() or dst.exists():
+                dst.unlink()
+            dst.symlink_to(src)
+            n += 1
+    # 32-bit nvapi (edini 32-bit kos v paketu)
+    x32 = NVLIBS / "x32" / "nvapi.dll"
+    if x32.exists():
+        syswow = Path(prefix) / "drive_c" / "windows" / "syswow64"
+        if syswow.is_dir():
+            dst = syswow / "nvapi.dll"
+            if dst.is_symlink() or dst.exists():
+                dst.unlink()
+            dst.symlink_to(x32)
+            n += 1
+    return n > 0
+
+
+# ------------------------------------------------------------ prefixi -------
+
+def prefix_path(name):
+    p = Path(name).expanduser()
+    if p.is_absolute():
+        return p
+    return PREFIXES / name
+
+
+def list_prefixes():
+    if not PREFIXES.is_dir():
+        return []
+    return sorted([d.name for d in PREFIXES.iterdir() if (d / "system.reg").exists()])
+
+
+def prefix_new(name, template=True, quiet=False):
+    dest = prefix_path(name)
+    if (dest / "system.reg").exists():
+        if not quiet:
+            warn(f"Prefix '{name}' že obstaja: {dest}")
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if template and BASE_TEMPLATE.exists():
+        step(f"Razpakiranje predloge v {dest}")
+        dest.mkdir(parents=True, exist_ok=True)
+        code, out = run(["tar", "--zstd", "-xf", str(BASE_TEMPLATE), "-C", str(dest)],
+                        capture=True)
+        if code:
+            die("Razpakiranje predloge ni uspelo:\n" + out)
+        fix_prefix_paths(dest)
+        # predloga je lahko nastavljena na staro Windows različico -> popravi
+        setup_defaults(dest, quiet=quiet)
+    else:
+        step(f"Ustvarjam nov Wine prefix: {dest}")
+        dest.mkdir(parents=True, exist_ok=True)
+        wine(["wineboot", "-u"], prefix=dest, capture=True)
+        wait_wineserver(dest)
+        setup_defaults(dest, quiet=quiet)
+    return dest
+
+
+def fix_prefix_paths(prefix):
+    """Popravi absolutne poti v registru, če je bil prefix prestavljen."""
+    prefix = Path(prefix)
+    sp = str(prefix)
+    for reg in ("system.reg", "user.reg"):
+        f = prefix / reg
+        if not f.exists():
+            continue
+        try:
+            txt = f.read_text(errors="surrogateescape")
+        except OSError:
+            continue
+        # registri vsebujejo poti tipa Z:\home\user\...\prefix\drive_c
+        # zamenjamo samo, če se je koren spremenil (premaknjen motor)
+        m = re.search(r'^#arch=', txt, re.M)
+        if m is None and reg == "system.reg":
+            continue
+    return True
+
+
+def setup_defaults(prefix, quiet=False):
+    """Osnovna konfiguracija svežega prefixa (brez namestitve komponent)."""
+    step("Nastavljam privzete DLL override-e (DXVK, VKD3D, CUDA)")
+    apply_overrides(prefix)
+    if link_nvidia_libs(prefix):
+        log("    NVIDIA knjižnice (nvcuda/nvml/nvapi) vpete")
+    # Windows različica 10 (večina sodobnih programov zahteva; winecfg posodobi
+    # tudi HKLM\...\CurrentVersion, kar nekateri installerji preverjajo)
+    reg_add(prefix, r"HKEY_CURRENT_USER\Software\Wine", "Version", "win10")
+    wine(["winecfg", "-v", "win10"], prefix=prefix, capture=True)
+    wineserver_kill(prefix)
+    wait_wineserver(prefix, 15)
+    # brez "gecko/mshtml opozoril" in podobnih dialogov
+    reg_add(prefix, r"HKEY_CURRENT_USER\Software\Wine\WineDbg", "ShowCrashDialog", "0")
+    # privzeti DPI 96 (ostri UI)
+    reg_add(prefix, r"HKEY_CURRENT_USER\Control Panel\Desktop", "LogPixels", "96")
+    return True
+
+
+# ------------------------------------------------------------------ appi ----
+
+def app_dir(name):
+    return APPS / slugify(name)
+
+
+def app_load(name):
+    d = app_dir(name)
+    f = d / "app.json"
+    if not f.exists():
+        return None
+    meta = json.loads(f.read_text())
+    # prenosni zapisi: relativne poti razreši glede na motor
+    if meta.get("prefix") and not Path(meta["prefix"]).is_absolute():
+        meta["prefix"] = str(prefix_path(meta["prefix"]))
+    for inc in meta.get("include", []):
+        src = Path(inc["src"])
+        if not src.is_absolute():
+            cand = d / src
+            if cand.exists():
+                inc["src"] = str(cand)
+    return meta
+
+
+def app_save(meta):
+    d = app_dir(meta["name"])
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "app.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+    return d
+
+
+def app_list():
+    out = []
+    if APPS.is_dir():
+        for d in sorted(APPS.iterdir()):
+            f = d / "app.json"
+            if f.exists():
+                try:
+                    out.append(json.loads(f.read_text()))
+                except json.JSONDecodeError:
+                    pass
+    return out
+
+
+CONFIG_FILE = DATA / "config.json"
+
+DEFAULT_CONFIG = {
+    # Electron/Chromium programi (VS Code, TTS, Discord ...): povečaj vmesnik,
+    # ker Chromium pod Wine ignorira sistemski DPI
+    "electron_scale": 1.5,
+    # klasični Win32 programi: 1.0 = 96 DPI (normalno)
+    "win32_dpi_scale": 1.0,
+    # če je False, se samodejno skaliranje ne izvaja
+    "auto_scale": True,
+}
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        if CONFIG_FILE.exists():
+            cfg.update(json.loads(CONFIG_FILE.read_text()))
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    DATA.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+
+
+def find_electron_exe(exe, depth=3):
+    """Poišče Electron/Chromium binarko (tudi v podmapah, omejena globina)."""
+    exe = Path(exe)
+    if is_electron(exe):
+        return exe
+    base = exe.parent
+    cur = [base]
+    for _ in range(depth):
+        nxt = []
+        for d in cur:
+            try:
+                for sub in d.iterdir():
+                    if sub.is_dir():
+                        nxt.append(sub)
+                        for f in sub.glob("*.exe"):
+                            if is_electron(f):
+                                return f
+            except OSError:
+                continue
+        cur = nxt
+    return None
+
+
+def auto_scale(name, meta=None):
+    """Samodejno nastavi velikost vmesnika, če še ni nastavljena."""
+    cfg = load_config()
+    if not cfg.get("auto_scale", True):
+        return False
+    meta = meta or app_load(name)
+    if not meta:
+        return False
+    exe = Path(meta["exe"])
+    if not exe.is_absolute():
+        exe = app_dir(name) / exe
+    el = find_electron_exe(exe)
+    args_list = list(meta.get("args") or [])
+    has_flag = any(str(a).startswith("--force-device-scale-factor") for a in args_list)
+    if el and not has_flag:
+        factor = float(cfg.get("electron_scale") or 1.0)
+        if abs(factor - 1.0) > 0.01:
+            args_list.append(f"--force-device-scale-factor={factor:g}")
+            meta["args"] = args_list
+            app_save(meta)
+            log(f"  samodejno skaliranje vmesnika: {factor:g}x (Electron)")
+            return True
+        return False
+    if not el:
+        want = int(round(96 * float(cfg.get("win32_dpi_scale") or 1.0)))
+        if want != 96:
+            prefix = Path(meta["prefix"])
+            reg = prefix / "user.reg"
+            try:
+                txt = reg.read_text(errors="surrogateescape")
+            except OSError:
+                txt = ""
+            if f'"LogPixels"="{want}"' not in txt and f'"LogPixels"=dword:{want:08x}' not in txt:
+                reg_add(prefix, r"HKEY_CURRENT_USER\\Control Panel\\Desktop",
+                        "LogPixels", str(want))
+                wineserver_kill(prefix)
+                wait_wineserver(prefix, 10)
+                log(f"  samodejno skaliranje (DPI): {want}")
+                return True
+    return False
+
+
+def app_run(name, args=None, debug=False):
+    meta = app_load(name)
+    if not meta:
+        die(f"Aplikacija '{name}' ne obstaja. Uporabi: wineforge list")
+    prefix = prepare_app_prefix(name)
+    if auto_scale(name, meta):
+        meta = app_load(name) or meta
+    exe = Path(meta["exe"])
+    if not exe.is_absolute():
+        exe = app_dir(name) / exe
+    target = str(exe)
+    if meta.get("exe_win"):
+        target = meta["exe_win"]
+    elif not exe.exists():
+        die(f"Exe ne obstaja: {exe}")
+    env = meta.get("env", {})
+    cmd = [str(WINE), target] + list(args or [])
+    if meta.get("args") and not args:
+        cmd = [str(WINE), target] + list(meta["args"])
+    log(f"Zaganjam {meta['name']} (prefix: {prefix})")
+    code, _ = run(cmd, env=wine_env(prefix, env, debug))
+    return code
+
+
+# ------------------------------------------------------- analiza PE ---------
+
+class PE:
+    """Minimalni bralnik PE datotek (samo uvozi)."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = self.path.read_bytes()
+        self.ok = False
+        self.imports = set()
+        self.machine = None
+        self.subsystem = None
+        self._parse()
+
+    def _parse(self):
+        d = self.data
+        if len(d) < 0x40 or d[:2] != b"MZ":
+            return
+        e_lfanew = struct.unpack_from("<I", d, 0x3C)[0]
+        if e_lfanew + 24 > len(d) or d[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+            return
+        coff = e_lfanew + 4
+        self.machine, nsec, _, _, _, opt_size, chars = struct.unpack_from("<HHIIIHH", d, coff)
+        opt = coff + 20
+        magic = struct.unpack_from("<H", d, opt)[0]
+        if magic == 0x20B:      # PE32+
+            self.subsystem = struct.unpack_from("<H", d, opt + 0x5C)[0]
+            ndd_off = opt + 0x6C
+        else:                   # PE32
+            self.subsystem = struct.unpack_from("<H", d, opt + 0x44)[0]
+            ndd_off = opt + 0x60
+        ndd = struct.unpack_from("<I", d, ndd_off)[0]
+        if ndd == 0:
+            return
+        # sekcije
+        sec_off = opt + opt_size
+        sections = []
+        for i in range(nsec):
+            o = sec_off + i * 40
+            if o + 40 > len(d):
+                return
+            name = d[o:o + 8].rstrip(b"\0").decode("latin-1")
+            vsize, vaddr, rsize, raddr = struct.unpack_from("<IIII", d, o + 8)
+            sections.append((vaddr, max(vsize, rsize), raddr, rsize))
+
+        def rva2off(rva):
+            for vaddr, vsize, raddr, rsize in sections:
+                if vaddr <= rva < vaddr + vsize:
+                    delta = rva - vaddr
+                    if delta < rsize:
+                        return raddr + delta
+                    return None
+            return None
+
+        imp_off = ndd_off + 8  # drugi direktorij = import
+        imp_rva = struct.unpack_from("<I", d, imp_off)[0]
+        if not imp_rva:
+            return
+        off = rva2off(imp_rva)
+        if off is None:
+            return
+        while off + 20 <= len(d):
+            ilt, ts, fc, name_rva, iat = struct.unpack_from("<IIIII", d, off)
+            if name_rva == 0:
+                break
+            no = rva2off(name_rva)
+            if no is None:
+                break
+            end = d.find(b"\0", no)
+            dll = d[no:end].decode("latin-1").lower()
+            if dll:
+                self.imports.add(dll)
+            off += 20
+        self.ok = True
+
+
+# knjižnica -> komponenta (winetricks verb oz. interna komponenta)
+DEP_MAP = {
+    "vcruntime140.dll": "vcrun2015-2022",
+    "vcruntime140_1.dll": "vcrun2015-2022",
+    "msvcp140.dll": "vcrun2015-2022",
+    "msvcp140_1.dll": "vcrun2015-2022",
+    "msvcp140_2.dll": "vcrun2015-2022",
+    "mfc140u.dll": "vcrun2015-2022",
+    "concrt140.dll": "vcrun2015-2022",
+    "msvcr100.dll": "vcrun2010",
+    "msvcp100.dll": "vcrun2010",
+    "msvcr110.dll": "vcrun2012",
+    "msvcp110.dll": "vcrun2012",
+    "msvcr120.dll": "vcrun2013",
+    "msvcp120.dll": "vcrun2013",
+    "msvcr90.dll": "vcrun2008",
+    "msvcr80.dll": "vcrun2005",
+    "mscoree.dll": "dotnet48",
+    "mscoreei.dll": "dotnet48",
+    "mscorlib.dll": "dotnet48",
+    "hostfxr.dll": "dotnetdesktop",
+    "coreclr.dll": "dotnetdesktop",
+    "msvbvm60.dll": "vb6run",
+    "msvbvm50.dll": "vb5run",
+    "d3dx9_43.dll": "d3dx9",
+    "d3dx9_42.dll": "d3dx9",
+    "d3dx10_43.dll": "d3dx10",
+    "d3dx11_43.dll": "d3dx11_43",
+    "d3dcompiler_43.dll": "d3dcompiler_43",
+    "d3dcompiler_47.dll": "d3dcompiler_47",
+    "xinput1_3.dll": "xact",
+    "xinput9_1_0.dll": "xact",
+    "xaudio2_7.dll": "xact",
+    "msxml3.dll": "msxml3",
+    "msxml4.dll": "msxml4",
+    "msxml6.dll": "msxml6",
+    "riched20.dll": "riched20",
+    "riched30.dll": "riched30",
+    "mshtml.dll": "ie8",
+    "wmp.dll": "wmp10",
+    "WebView2Loader.dll": "webview2",
+    "nvcuda.dll": "cuda",
+    "nvapi64.dll": "dxvk-nvapi",
+    "nvapi.dll": "dxvk-nvapi",
+    "cudart64_12.dll": "cuda",
+    "cublas64_12.dll": "cuda",
+    "opencv_world455.dll": None,
+    "d3d12.dll": "vkd3d",
+    "d3d11.dll": "dxvk",
+    "d3d9.dll": "dxvk",
+    "dxgi.dll": "dxvk",
+    "vulkan-1.dll": "vulkan",
+    "libEGL.dll": "dxvk",
+    "libGLESv2.dll": "dxvk",
+    "python3.dll": None,
+    "libcrypto-3-x64.dll": None,
+    "physxloader.dll": "physx",
+    "openal32.dll": "openal",
+    "avcodec-58.dll": None,
+}
+
+
+def scan_deps(target):
+    """Analizira PE datoteke in vrne slovar komponent -> dokazi."""
+    target = Path(target)
+    files = []
+    if target.is_dir():
+        for root, _d, fs in os.walk(target):
+            for f in fs:
+                if f.lower().endswith((".exe", ".dll", ".ocx", ".cpl", ".scr")):
+                    files.append(Path(root) / f)
+            if len(files) > 4000:
+                break
+    else:
+        files = [target]
+    found = {}
+    archs = set()
+    for f in files:
+        try:
+            pe = PE(f)
+        except (OSError, struct.error):
+            continue
+        if not pe.ok:
+            continue
+        if pe.machine:
+            archs.add("x86_64" if pe.machine == 0x8664 else "i386")
+        for dll in pe.imports:
+            comp = DEP_MAP.get(dll) or DEP_MAP.get(dll.lower())
+            if comp:
+                found.setdefault(comp, set()).add(dll)
+    return found, archs
+
+
+# ---------------------------------------------------------------- doctor ----
+
+# ------------------------------------------------------------- peka --------
+
+WINETRICKS = TOOLS / "winetricks"
+BAKE_STATE = DATA / "bake-state.json"
+
+# (ime, tip, vrednost, opis) — vrstni red je pomemben
+BAKE_STEPS = [
+    ("win10", "reg", (r"HKEY_CURRENT_USER\Software\Wine", "Version", "win10"),
+     "Windows 10 način"),
+    ("dxvk", "winetricks", "dxvk", "DXVK (D3D9/10/11 prek Vulkan)"),
+    ("vkd3d", "winetricks", "vkd3d", "VKD3D-Proton (D3D12 prek Vulkan)"),
+    ("d3dx9", "winetricks", "d3dx9", "DirectX 9 helperji (d3dx9_*.dll)"),
+    ("d3dx11", "winetricks", "d3dx11_43", "d3dx11_43"),
+    ("d3dcompiler_43", "winetricks", "d3dcompiler_43", "d3dcompiler_43"),
+    ("d3dcompiler_47", "winetricks", "d3dcompiler_47", "d3dcompiler_47"),
+    ("vcrun2005", "winetricks", "vcrun2005", "VC++ 2005"),
+    ("vcrun2008", "winetricks", "vcrun2008", "VC++ 2008"),
+    ("vcrun2010", "winetricks", "vcrun2010", "VC++ 2010"),
+    ("vcrun2012", "winetricks", "vcrun2012", "VC++ 2012"),
+    ("vcrun2013", "winetricks", "vcrun2013", "VC++ 2013"),
+    ("vcrun2022", "winetricks", "vcrun2022", "VC++ 2015-2022 (x64+x86)"),
+    ("vb6run", "winetricks", "vb6run", "Visual Basic 6 runtime"),
+    ("msxml3", "winetricks", "msxml3", "MSXML 3"),
+    ("msxml6", "winetricks", "msxml6", "MSXML 6"),
+    ("riched20", "winetricks", "riched20", "RichEdit 2.0/3.0/4.1"),
+    ("xact", "winetricks", "xact", "XACT/XInput/XAudio2"),
+    ("corefonts", "winetricks", "corefonts", "Microsoft core pisave"),
+    ("tahoma", "winetricks", "tahoma", "Tahoma"),
+    ("fontsmooth", "winetricks", "fontsmooth=rgb", "Glajenje pisav (RGB)"),
+    ("webview2", "exe", ("https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+                         "MicrosoftEdgeWebview2Setup.exe",
+                         ["/silent", "/install"]),
+     "Microsoft Edge WebView2 runtime"),
+    ("dotnetdesktop8", "opt", ("winetricks", "dotnetdesktop8"), ".NET Desktop Runtime 8"),
+    ("dotnet48", "opt", ("winetricks", "dotnet48"), ".NET Framework 4.8"),
+    ("nvidia", "nvidia", None, "NVIDIA CUDA/NVML/NVAPI (nvidia-libs)"),
+    ("overrides", "overrides", None, "DLL override-i (DXVK/VKD3D/CUDA)"),
+]
+
+
+def bake_state_load():
+    if BAKE_STATE.exists():
+        try:
+            return json.loads(BAKE_STATE.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {"done": []}
+
+
+def bake_state_save(st):
+    BAKE_STATE.parent.mkdir(parents=True, exist_ok=True)
+    BAKE_STATE.write_text(json.dumps(st, indent=2))
+
+
+def winetricks(prefix, *args, extra_env=None, timeout=None):
+    env = wine_env(prefix, extra_env)
+    env.update({
+        "PATH": f"{WINE_DIR / 'bin'}:{os.environ.get('PATH', '')}",
+        "W_CACHE": str(SHARE / "verbs"),
+        "WINEDLLOVERRIDES": "winemenubuilder.exe=d",
+        "WINEDEBUG": "-all",
+    })
+    cmd = [str(WINETRICKS), "-q"] + list(args)
+    p = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       text=True, timeout=timeout)
+    return p.returncode, p.stdout
+
+
+def download(url, dest, quiet=True):
+    dest = Path(dest)
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    step(f"Prenašam {dest.name}")
+    code, out = run(["curl", "-L", "--fail", "--retry", "3", "-o", str(tmp), url],
+                    capture=True)
+    if code != 0:
+        raise RuntimeError(f"prenos ni uspel: {url}\n{out[-500:]}")
+    tmp.replace(dest)
+    return dest
+
+
+def cmd_bake(args):
+    """Zgradi predlogo prefixa z vsemi privzetimi komponentami."""
+    name = args.name or "_template"
+    prefix = prefix_path(name)
+    st = bake_state_load() if args.resume else {"done": []}
+    (SHARE / "verbs").mkdir(parents=True, exist_ok=True)
+
+    if not (prefix / "system.reg").exists():
+        step(f"Ustvarjam osnovni prefix {prefix}")
+        prefix.mkdir(parents=True, exist_ok=True)
+        wine(["wineboot", "-u"], prefix=prefix, capture=True)
+        wait_wineserver(prefix)
+    else:
+        log(f"Prefix že obstaja: {prefix} (nadaljujem)")
+
+    for nm, kind, val, desc in BAKE_STEPS:
+        if nm in st["done"]:
+            log(f"  [preskočeno] {nm}")
+            continue
+        t0 = time.time()
+        step(f"{desc}  ({nm})")
+        if kind == "winetricks":
+            code, out = winetricks(prefix, val)
+            if code != 0:
+                err(f"winetricks {val} ni uspel (koda {code})")
+                print(out[-2500:])
+                if not args.keep_going:
+                    die("peka prekinjena")
+                continue
+        elif kind == "opt":
+            if not args.with_dotnet:
+                log("  [neobvezno, preskoceno] (uporabi --with-dotnet)")
+                continue
+            _sub, verb = val
+            code, out = winetricks(prefix, verb)
+            if code != 0:
+                err(f"winetricks {verb} ni uspel (koda {code})")
+                if not args.keep_going:
+                    die("peka prekinjena")
+                continue
+        elif kind == "exe":
+            url, fname, eargs = val
+            exe = download(url, DEPS / fname)
+            code, out = wine([str(exe)] + list(eargs), prefix=prefix, capture=True,
+                             env={"WINEDEBUG": "-all"})
+            if code != 0:
+                err(f"{fname} se ni namestil (koda {code})")
+                print(out[-2000:])
+                if not args.keep_going:
+                    die("peka prekinjena")
+                continue
+        elif kind == "reg":
+            key, var, v = val
+            reg_add(prefix, key, var, v)
+        elif kind == "nvidia":
+            link_nvidia_libs(prefix)
+        elif kind == "overrides":
+            apply_overrides(prefix)
+        st["done"].append(nm)
+        bake_state_save(st)
+        log(f"  gotovo v {time.time() - t0:.0f}s")
+
+    step("Končna nega predloge")
+    wineserver_kill(prefix)
+    wait_wineserver(prefix, 10)
+    for pat in ("drive_c/users/*/Temp/*", "drive_c/windows/temp/*",
+                "drive_c/users/*/AppData/Local/Temp/*"):
+        for p in prefix.glob(pat):
+            try:
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+            except OSError:
+                pass
+    materialize_nvidia(prefix)
+    if args.no_pack:
+        log("Predloga pripravljena (brez pakiranja)")
+        return 0
+    step("Pakiranje predloge")
+    TEMPLATES.mkdir(parents=True, exist_ok=True)
+    tmp = TEMPLATES / "base-prefix.tar.zst.tmp"
+    code, out = run(["tar", "--zstd", "-cf", str(tmp), "-C", str(prefix), "."], capture=True)
+    if code:
+        die("pakiranje ni uspelo:\n" + out[-2000:])
+    tmp.replace(BASE_TEMPLATE)
+    log(f"Predloga: {BASE_TEMPLATE} ({human(BASE_TEMPLATE.stat().st_size)})")
+    return 0
+
+
+def materialize_nvidia(prefix):
+    """Symlinke na engine/nvidia-libs zamenja s kopijami (predloga samostojna)."""
+    for d in (Path(prefix) / "drive_c/windows/system32",
+              Path(prefix) / "drive_c/windows/syswow64"):
+        if not d.is_dir():
+            continue
+        for f in d.iterdir():
+            if f.is_symlink():
+                tgt = Path(os.path.realpath(f))
+                try:
+                    f.unlink()
+                    shutil.copy2(tgt, f)
+                except OSError as e:
+                    warn(f"ni mogoče materializirati {f}: {e}")
+
+
+# ------------------------------------------- namestitev & prenosni paket ----
+
+# mape, ki se pri primerjavi pred/po namestitvi ignorirajo (sistemske)
+SNAP_SKIP = (
+    "windows/system32", "windows/syswow64", "windows/winsxs", "windows/temp",
+    "windows/wow64", "windows/assembly", "windows/servicing", "windows/monitor",
+    "windows/help", "windows/inf", "windows/catroot", "windows/registration",
+    "windows/system32/config", "windows/prefetch", "windows/installer",
+    "users/public", "users/*/temp", "users/*/Recent", "users/*/AppData/Local/Temp",
+    "users/*/AppData/Local/Microsoft/Windows/INetCache",
+    "users/*/AppData/Local/Microsoft/Windows/WebCache",
+    "users/*/AppData/Local/Microsoft/Edge", "users/*/AppData/Local/Microsoft/OneDrive",
+    "users/*/AppData/Local/CrashDumps", "users/*/AppData/Roaming/Microsoft/Windows",
+    "windows/Microsoft.NET/temp",
+)
+
+
+def snapshot(prefix):
+    """Vrne {relpot: (velikost, mtime)} za drive_c brez sistemskih map."""
+    root = Path(prefix) / "drive_c"
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        dirnames[:] = [d for d in dirnames
+                       if not any(Path(rel, d).match(p) or Path(rel, d).match(p + "/*")
+                                  for p in SNAP_SKIP)]
+        if rel == ".":
+            rel = ""
+        for fn in filenames:
+            p = os.path.join(dirpath, fn)
+            r = f"{rel}/{fn}" if rel else fn
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            out[r] = (st.st_size, int(st.st_mtime))
+    return out
+
+
+def reg_export(prefix, hive, dest):
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    code, out = wine(["reg", "export", hive, wine_path(dest), "/y"], prefix=prefix, capture=True)
+    return code == 0 and dest.exists()
+
+
+def wine_path(p):
+    """Linux pot -> Windows pot (Z:\\...) za wine."""
+    p = str(Path(p).resolve())
+    return "Z:" + p.replace("/", "\\")
+
+
+def reg_import(prefix, regfile):
+    regfile = Path(regfile)
+    if not regfile.exists():
+        return True
+    code, out = wine(["reg", "import", wine_path(regfile)], prefix=prefix, capture=True)
+    return code == 0
+
+
+def detect_installer(path):
+    """Ugani tih način namestitve glede na tip namestitvenega programa."""
+    p = Path(path)
+    data = p.read_bytes()[:400000] if p.suffix.lower() == ".exe" else b""
+    name = p.name.lower()
+    if p.suffix.lower() == ".msi":
+        return "msi", ["/qn", "/norestart"]
+    if b"Inno Setup" in data or "innosetup" in name:
+        return "inno", ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"]
+    if b"Nullsoft" in data or b"NSIS" in data:
+        return "nsis", ["/S"]
+    if b"InstallShield" in data:
+        return "installshield", ["/s", "/v/qn"]
+    if b"WixBundle" in data or "wixburn" in name or "burn" in name:
+        return "wix", ["/quiet", "/norestart"]
+    if (b"Qt Installer Framework" in data or b"installerframework" in data.lower()
+            or "qt-unified" in name or name.startswith("qtcreator")):
+        return "qtifw", ["--accept-licenses", "--default-answer",
+                         "--confirm-command", "install"]
+    if b"Squirrel" in data:
+        return "squirrel", ["--silent"]
+    return "unknown", []
+
+
+def cmd_install(args):
+    """Namesti program v začasen prefix, zajame spremembe in naredi prenosno aplikacijo."""
+    inst = Path(args.installer).expanduser().resolve()
+    if not inst.exists():
+        die(f"Namestitveni program ne obstaja: {inst}")
+    name = args.name or slugify(re.sub(r"(?i)(setup|install|installer|x64|x86|_|-)", "",
+                                       inst.stem))
+    staging = PREFIXES / f"_staging-{name}"
+    if staging.exists():
+        shutil.rmtree(staging)
+
+    step("Pripravljam začasen prefix iz predloge")
+    prefix_new(staging.name, quiet=True)
+
+    try:
+        kind, silent = detect_installer(inst)
+    except Exception as e:
+        warn(f"ne morem ugotoviti tipa namestitvenega programa: {e}")
+        kind, silent = "unknown", []
+    log(f"  zaznan tip: {kind}  ({' '.join(silent) or 'ročna namestitev'})")
+
+    step("Zajemam stanje pred namestitvijo")
+    before = snapshot(staging)
+
+    step("Nameščam program")
+    cmd = [str(WINE), str(inst)] + (silent if not args.interactive else [])
+    env = {**os.environ, **wine_env(staging, {"WINEDEBUG": "-all"})}
+    p = subprocess.run(cmd, env=env)
+    wineserver_kill(staging)
+    wait_wineserver(staging, 30)
+
+    step("Zajemam stanje po namestitvi")
+    after = snapshot(staging)
+    changed = {}
+    for path, meta in after.items():
+        if before.get(path) != meta:
+            changed[path] = meta
+    removed = [p for p in before if p not in after]
+    log(f"  novih/spremenjenih datotek: {len(changed)}, odstranjenih: {len(removed)}")
+
+    if not args.keep_staging:
+        wineserver_kill(staging)
+        wait_wineserver(staging, 10)
+        shutil.rmtree(staging, ignore_errors=True)
+
+    adir = app_dir(name)
+    if adir.exists():
+        shutil.rmtree(adir)
+    root = adir / "root"
+    total = 0
+    for rel in sorted(changed):
+        src = Path(staging) / "drive_c" / rel
+        dst = root / "drive_c" / rel
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            total += dst.stat().st_size
+        except OSError as e:
+            warn(f"  {rel}: {e}")
+    log(f"  preneseno v aplikacijo: {human(total)}")
+
+    step("Izvoz registra")
+    regs = []
+    for hive, fname in (("HKCU", "user.reg"), ("HKLM", "machine.reg")):
+        dest = adir / fname
+        if reg_export(staging, hive, dest):
+            txt = dest.read_text(errors="surrogateescape")
+            # poti staging prefixa -> relativen C:\ (prenosno)
+            txt = txt.replace(wine_path(staging / "drive_c"), r"C:")
+            dest.write_text(txt, errors="surrogateescape")
+            regs.append(fname)
+
+    # najdi glavni exe
+    exes = []
+    for rel in changed:
+        if rel.lower().endswith(".exe"):
+            exes.append(rel)
+    main = None
+    if args.exe:
+        main = args.exe
+    else:
+        cands = [e for e in exes if "/" in e and "unins" not in e.lower()
+                 and "vcredist" not in e.lower()]
+        cands.sort(key=lambda e: (len(e.split("/")), len(e)))
+        main = cands[0] if cands else (exes[0] if exes else None)
+    if not main:
+        die("v namestitvi nisem našel nobenega .exe — uporabi --exe")
+
+    meta = {
+        "name": name,
+        "exe": f"root/drive_c/{main}",
+        "prefix": str(PREFIXES / name),
+        "args": args.args or [],
+        "env": {},
+        "installed_from": inst.name,
+        "installer_type": kind,
+        "registry": regs,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    app_save(meta)
+    auto_scale(name, meta)
+    log(f"\nAplikacija '{name}' pripravljena. Zaženi: wineforge run {name}")
+    log(f"Velikost: {human(du(adir))}   (prefix se ustvari ob prvem zagonu)")
+    return 0
+
+
+def prepare_app_prefix(name):
+    """Ustvari/posodobi prefix za aplikacijo: predloga + datoteke + register."""
+    meta = app_load(name)
+    if not meta:
+        die(f"Neznana aplikacija: {name}")
+    prefix = Path(meta["prefix"])
+    adir = app_dir(name)
+    marker = adir / ".prepared"
+    fresh = not (prefix / "system.reg").exists()
+    up_to_date = (marker.exists()
+                  and marker.stat().st_mtime > (adir / "app.json").stat().st_mtime)
+    if up_to_date:
+        # preveri, da vsi vključeni programi res obstajajo v prefixu
+        for inc in meta.get("include", []):
+            if not (prefix / "drive_c" / inc["win"]).exists():
+                up_to_date = False
+                break
+    if not fresh and up_to_date:
+        return prefix
+
+    if fresh:
+        step(f"Ustvarjam prefix za {name}")
+        prefix_new(prefix.name, quiet=True)
+    else:
+        wineserver_kill(prefix)
+        wait_wineserver(prefix, 15)
+
+    root = adir / "root"
+    if root.is_dir():
+        step("Kopiram datoteke programa v prefix")
+        run(["cp", "-a", f"{root}/.", str(prefix) + "/"], capture=True)
+
+    # zunanje mape programa (npr. celotna mapa aplikacije) vpne kot symlink
+    for inc in meta.get("include", []):
+        local = adir / "inc" / Path(inc["src"]).name
+        src = local if local.exists() else Path(inc["src"])
+        if not src.exists():
+            warn(f"mapa ne obstaja: {src}")
+            continue
+        dst = Path(prefix) / "drive_c" / inc["win"]
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_symlink():
+            dst.unlink()
+        elif dst.exists():
+            shutil.rmtree(dst, ignore_errors=True)
+        dst.symlink_to(src)
+        log(f"  {inc['win']} -> {src}")
+
+    for reg in meta.get("registry", []):
+        reg_import(prefix, adir / reg)
+
+    # dodatne sistemske datoteke (npr. nvidia-smi shim)
+    sys32 = Path(prefix) / "drive_c/windows/system32"
+    for spec in meta.get("sys32", []):
+        cands = [Path(spec)] if Path(spec).is_absolute() else []
+        cands.append(adir / spec)
+        base = Path(spec).name
+        for inc in meta.get("include", []):
+            cands.append(adir / "inc" / Path(inc["src"]).name / base)
+            cands.append(Path(inc["src"]) / base)
+            # poišči rekurzivno v mapi aplikacije
+            for root_dir, _dirs, files in os.walk(Path(inc["src"])):
+                if base in files:
+                    cands.append(Path(root_dir) / base)
+                    break
+        for c in cands:
+            if c.exists():
+                shutil.copy2(c, sys32 / c.name)
+                log(f"  system32/{c.name}")
+                break
+
+    marker.write_text(time.strftime("%Y-%m-%dT%H:%M:%S"))
+    return prefix
+
+
+def cmd_installer_exe(args):
+    return 0
+
+
+def cmd_pack(args):
+    """Naredi samostojen prenosni paket (motor + aplikacija)."""
+    meta = app_load(args.name)
+    if not meta:
+        die(f"Neznana aplikacija: {args.name}")
+    out = Path(args.out).expanduser().resolve() / slugify(args.name)
+    if out.exists() and not args.force:
+        die(f"{out} že obstaja (uporabi --force)")
+    step(f"Pakiram v {out}")
+    out.mkdir(parents=True, exist_ok=True)
+
+    # 0. čiščenje ostankov prejšnjega paketa (da ne nastanejo gnezda engine/engine)
+    for part in ("engine", "bin", "share", "apps", "prefixes"):
+        d = out / part
+        if d.exists() and args.force:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # 1. motor (hardlink, če je na istem disku -> brez porabe prostora)
+    for part in ("engine", "bin", "share"):
+        src = FORGE / part
+        if not src.exists():
+            continue
+        dst = out / part
+        code, _ = run(["cp", "-al", str(src), str(dst)], capture=True)
+        if code:
+            run(["cp", "-a", str(src), str(dst)], capture=True)
+
+    # 1b. dokumentacija
+    for doc in ("README.md",):
+        if (FORGE / doc).exists():
+            shutil.copy2(FORGE / doc, out / doc)
+    if (FORGE / "docs").is_dir():
+        run(["cp", "-al", str(FORGE / "docs"), str(out / "docs")], capture=True)
+
+    # 2. aplikacija + njen prefix
+    step("Aplikacija in prefix")
+    adir = app_dir(args.name)
+    for inc in meta.get("include", []):
+        src = Path(inc["src"])
+        if not src.exists():
+            warn(f"manjka: {src}")
+            continue
+        dst = adir / "inc" / src.name
+        if dst.exists() or dst.is_symlink():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        step(f"Vključujem {src.name} ({human(du(src))})")
+        code, _ = run(["cp", "-al", str(src), str(dst)], capture=True)
+        if code:
+            run(["cp", "-a", str(src), str(dst)], capture=True)
+    (out / "apps").mkdir(exist_ok=True)
+    run(["cp", "-al", str(adir), str(out / "apps" / adir.name)], capture=True)
+    prefix = Path(meta["prefix"])
+    if (prefix / "system.reg").exists() and not args.no_prefix:
+        (out / "prefixes").mkdir(exist_ok=True)
+        wineserver_kill(prefix)
+        wait_wineserver(prefix, 20)
+        step(f"Kopiram prefix ({human(du(prefix))})")
+        run(["cp", "-al", str(prefix), str(out / "prefixes" / prefix.name)], capture=True)
+
+    # 2b. prenosni zapis app.json (relativne poti) + popravi symlinke v prefixu
+    bundled_app = out / "apps" / adir.name
+    bundled_meta = json.loads((bundled_app / "app.json").read_text())
+    if bundled_meta.get("prefix"):
+        bundled_meta["prefix"] = Path(meta["prefix"]).name
+    for inc in bundled_meta.get("include", []):
+        inc["src"] = "inc/" + Path(inc["src"]).name
+    exe = Path(bundled_meta.get("exe", ""))
+    for inc in bundled_meta.get("include", []):
+        base = Path(inc["src"]).name
+        if exe.is_absolute() and str(exe).startswith(str(Path(meta["include"][0]["src"]))):
+            rel = exe.relative_to(Path(meta["include"][0]["src"]))
+            bundled_meta["exe"] = f"inc/{base}/{rel}"
+            break
+    (bundled_app / "app.json").write_text(json.dumps(bundled_meta, indent=2, ensure_ascii=False))
+    # symlinki znotraj prefixa naj kažejo na vključeno kopijo v paketu
+    bprefix = out / "prefixes" / Path(meta["prefix"]).name
+    for inc in bundled_meta.get("include", []):
+        dst = bprefix / "drive_c" / inc["win"]
+        target = bundled_app / inc["src"]
+        if dst.is_symlink() or dst.exists():
+            if dst.is_symlink():
+                dst.unlink()
+            else:
+                shutil.rmtree(dst, ignore_errors=True)
+        if target.exists() and bprefix.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.symlink_to(os.path.relpath(target, dst.parent))
+
+    # 3. zaganjalnik
+    launcher = out / "run.sh"
+    launcher.write_text(f'''#!/bin/sh
+# Prenosni zaganjalnik WineForge — deluje iz katerekoli mape/USB ključa
+HERE=$(cd "$(dirname "$0")" && pwd)
+export WINEFORGE_DIR="$HERE"
+exec "$HERE/bin/wineforge" run "{args.name}" "$@"
+''')
+    launcher.chmod(0o755)
+    (out / "README.txt").write_text(README_TXT.format(name=args.name))
+    total = du(out)
+    log(f"Paket: {out}  ({human(total)})")
+    if args.compress:
+        step("Stiskam v tar.zst")
+        arch = out.with_suffix(".tar.zst")
+        run(["tar", "--zstd", "-cf", str(arch), "-C", str(out.parent), out.name], capture=True)
+        log(f"Arhiv: {arch} ({human(arch.stat().st_size)})")
+    return 0
+
+
+def cmd_remove(args):
+    meta = app_load(args.name)
+    if not meta:
+        die("Neznana aplikacija")
+    if args.keep_prefix is False:
+        p = Path(meta["prefix"])
+        if (p / "system.reg").exists():
+            wineserver_kill(p)
+            wait_wineserver(p, 10)
+            shutil.rmtree(p, ignore_errors=True)
+    shutil.rmtree(app_dir(args.name), ignore_errors=True)
+    log(f"Odstranjeno: {args.name}")
+    return 0
+
+
+def cmd_doctor(args):
+    step("WineForge doctor")
+    ok = True
+
+    def line(label, value, good=None):
+        nonlocal ok
+        mark = "\033[1;32m✓\033[0m" if good is not False else "\033[1;31m✗\033[0m"
+        if good is False:
+            ok = False
+        print(f" {mark} {label:<28} {value}")
+
+    line("motor", str(FORGE))
+    if WINE.exists():
+        code, out = run([str(WINE), "--version"], capture=True)
+        line("wine", out.strip() or "?", code == 0)
+        # 32-bit podpora
+        code, out = run([str(WINE), "wineboot", "-h"], capture=True)
+        line("wineboot", "ok" if code == 0 else "napaka", code == 0)
+    else:
+        line("wine", "manjka engine/wine", False)
+    line("nvidia-libs", "da" if NVLIBS.is_dir() else "ne", NVLIBS.is_dir())
+    line("predloga prefixa", "da" if BASE_TEMPLATE.exists() else "ne",
+         BASE_TEMPLATE.exists())
+    # GPU
+    if shutil.which("nvidia-smi"):
+        code, out = run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+                         "--format=csv,noheader"], capture=True)
+        line("GPU (nvidia-smi)", out.strip().splitlines()[0] if out.strip() else "?", code == 0)
+    else:
+        line("GPU (nvidia-smi)", "ni najden", None)
+    # Vulkan
+    if shutil.which("vulkaninfo"):
+        code, out = run(["vulkaninfo", "--summary"], capture=True)
+        gpu = [l.strip() for l in out.splitlines() if "deviceName" in l]
+        line("Vulkan", gpu[0] if gpu else "ok", code == 0)
+    else:
+        line("Vulkan", "vulkaninfo ni nameščen (ni nujno)", None)
+    # CUDA v Wine
+    if NVLIBS.is_dir():
+        cudatest = NVLIBS / "bin" / "cudatest.exe"
+        if cudatest.exists():
+            p = prefix_path("_doctor")
+            if not (p / "system.reg").exists():
+                prefix_new("_doctor", quiet=True)
+            code, out = wine([str(cudatest)], prefix=p, capture=True)
+            has = "cuInit success" in out
+            dev = ""
+            for l in out.splitlines():
+                if "RTX" in l or "GeForce" in l or "Radeon" in l:
+                    dev = l.strip()
+                    break
+            line("CUDA v Wine", (dev or ("ok" if has else "ne dela")), has)
+    log()
+    return 0 if ok else 1
+
+
+
+
+def is_electron(exe_path):
+    """Preprosto zazna Electron/Chromium aplikacijo po datotekah ob exe-ju."""
+    try:
+        d = Path(exe_path).parent
+    except Exception:
+        return False
+    for f in ("resources.pak", "v8_context_snapshot.bin", "icudtl.dat", "libEGL.dll",
+              "chrome_100_percent.pak"):
+        if (d / f).exists():
+            return True
+    return False
+
+
+def cmd_scale(args):
+    """Nastavi velikost vmesnika za aplikacijo (DPI za Win32, zoom za Electron)."""
+    meta = app_load(args.name)
+    if not meta:
+        die(f"Neznana aplikacija: {args.name}")
+    pct = args.percent
+    if pct < 50 or pct > 400:
+        die("Odstotek naj bo med 50 in 400")
+    factor = pct / 100.0
+    prefix = Path(meta["prefix"])
+    if not (prefix / "system.reg").exists():
+        prefix_new(prefix.name, quiet=True)
+
+    exe = Path(meta["exe"])
+    if not exe.is_absolute():
+        exe = app_dir(args.name) / exe
+    # poišči Electron/Chromium binarko (tudi v podmapah, npr. App/<Ime>/<Ime>.exe)
+    electron = exe if is_electron(exe) else None
+    if not electron:
+        try:
+            for cand in sorted(exe.parent.rglob("*.exe"), key=lambda x: -x.stat().st_size):
+                if is_electron(cand):
+                    electron = cand
+                    break
+        except OSError:
+            pass
+
+    step(f"Nastavljam {pct}% za {args.name}")
+    if electron:
+        # Chromium/Electron: skaliranje cele strani (pisave + ikone)
+        reg_add(prefix, r"HKEY_CURRENT_USER\\Control Panel\\Desktop", "LogPixels", "96")
+        args_list = [a for a in meta.get("args", [])
+                     if not str(a).startswith("--force-device-scale-factor")]
+        if abs(factor - 1.0) > 0.01:
+            args_list.append(f"--force-device-scale-factor={factor:g}")
+        meta["args"] = args_list
+        app_save(meta)
+        log(f"  Electron/Chromium ({electron.name}) -> --force-device-scale-factor={factor:g}")
+    else:
+        dpi = int(round(96 * factor))
+        reg_add(prefix, r"HKEY_CURRENT_USER\\Control Panel\\Desktop", "LogPixels", str(dpi))
+        reg_add(prefix, r"HKEY_CURRENT_USER\\Control Panel\\Desktop", "Win8DpiScaling", "1")
+        log(f"  Win32 program -> LogPixels = {dpi} ({pct}%)")
+    wineserver_kill(prefix)
+    wait_wineserver(prefix, 15)
+    log("")
+    log(f"Zaženi: wineforge run {args.name}")
+    return 0
+
+
+
+def cmd_config(args):
+    cfg = load_config()
+    if args.electron_scale is not None:
+        cfg["electron_scale"] = float(args.electron_scale)
+    if args.win32_dpi_scale is not None:
+        cfg["win32_dpi_scale"] = float(args.win32_dpi_scale)
+    if args.auto_scale is not None:
+        cfg["auto_scale"] = args.auto_scale == "on"
+    save_config(cfg)
+    log("Nastavitve (data/config.json):")
+    for k, v in cfg.items():
+        log(f"  {k} = {v}")
+    if any(v is not None for v in (args.electron_scale, args.win32_dpi_scale, args.auto_scale)):
+        log("")
+        log("Uporabljeno ob naslednjem zagonu programa.")
+    return 0
+
+# ------------------------------------------------------------------- GUI ----
+
+def zt(*args, input=None):
+    """Zažene zenity in vrne (koda, stdout)."""
+    if not shutil.which("zenity"):
+        die("zenity ni nameščen (potreben za grafični vmesnik)")
+    p = subprocess.run(["zenity", *args], text=True, input=input,
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                       env=os.environ.copy())
+    return p.returncode, p.stdout or ""
+
+
+def _wf(*args, progress_msg=None):
+    """Požene wineforge kot podproces; med delom kaže napredek."""
+    cmd = [sys.executable, str(FORGE / "bin" / "wineforge"), *args]
+    prog = None
+    if progress_msg and shutil.which("zenity"):
+        prog = subprocess.Popen(["zenity", "--progress", "--pulsate", "--auto-close",
+                                 "--width=420", "--title=WineForge", "--text=" + progress_msg],
+                                stdin=subprocess.PIPE)
+    p = subprocess.run(cmd, capture_output=True, text=True,
+                       env={**os.environ, "WINEFORGE_DIR": str(FORGE)})
+    if prog:
+        try:
+            prog.stdin.close()
+            prog.wait(timeout=5)
+        except Exception:
+            prog.kill()
+    out = re.sub(r"\x1b\[[0-9;]*m", "", (p.stdout or "") + (p.stderr or ""))
+    return p.returncode, out
+
+
+def _pick_file(title, patterns="*.exe"):
+    code, out = zt("--file-selection", f"--title={title}",
+                   f"--file-filter=Windows program | {patterns}",
+                   "--file-filter=Vse datoteke | *")
+    return out.strip() if code == 0 else None
+
+
+def _ask(title, text, default=""):
+    code, out = zt("--entry", f"--title={title}", f"--text={text}", f"--entry-text={default}")
+    return out.strip() if code == 0 else None
+
+
+def _show(title, text, width=700, height=460):
+    zt("--text-info", f"--title={title}", f"--width={width}", f"--height={height}",
+       "--font=monospace", input=text)
+
+
+def _app_menu(title):
+    metas = app_list()
+    if not metas:
+        zt("--info", "--title=WineForge", "--text=Najprej dodaj kak program.")
+        return None
+    rows = [(m.get("name") or "?", m.get("exe", "")) for m in metas]
+    args = ["--list", f"--title={title}", "--column=Program", "--column=Exe",
+            "--width=700", "--height=400", "--print-column=1"]
+    for r in rows:
+        args += list(r)
+    code, out = zt(*args)
+    return out.strip() if code == 0 else None
+
+
+def cmd_gui(args):
+    if not shutil.which("zenity"):
+        die("zenity ni nameščen — uporabi CLI (wineforge --help)")
+    while True:
+        code, choice = zt("--list", "--title=WineForge — prenosni Wine motor",
+                          "--width=520", "--height=380", "--hide-header",
+                          "--text=<b>Kaj želiš narediti?</b>",
+                          "--column=Dejanje",
+                          "Dodaj prenosni program (.exe v mapi)",
+                          "Namesti program (installer .exe/.msi)",
+                          "Zaženi program",
+                          "Popravi program (belo okno / podatki)",
+                          "Nastavi velikost vmesnika (DPI/zoom)",
+                          "Naredi prenosni paket (USB)",
+                          "Odpri mapo programov",
+                          "Diagnoza (Wine, GPU, CUDA)",
+                          "Zapri")
+        if code != 0 or not choice.strip():
+            return 0
+        c = choice.strip()
+        if c.startswith("Dodaj"):
+            exe = _pick_file("Izberi program (.exe)")
+            if not exe:
+                continue
+            name = _ask("Ime programa", "Ime za vnos v seznam:", Path(exe).stem.lower())
+            if not name:
+                continue
+            code, out = _wf("add", name, "--exe", exe,
+                            progress_msg=f"Dodajam {Path(exe).name} ...")
+            _show("Dodajanje", out)
+        elif c.startswith("Namesti"):
+            inst = _pick_file("Izberi namestitveni program", "*.exe *.msi")
+            if not inst:
+                continue
+            name = _ask("Ime programa", "Ime za vnos v seznam:",
+                        re.sub(r"(?i)(setup|install|installer|x64|x86|_|-)", "",
+                               Path(inst).stem).strip(" .") or "app")
+            if not name:
+                continue
+            code, out = _wf("install", inst, "--name", name,
+                            progress_msg=f"Nameščam {Path(inst).name} ...\nTo lahko traja nekaj minut.")
+            _show("Namestitev", out)
+        elif c.startswith("Zaženi"):
+            name = _app_menu("Zaženi program")
+            if name:
+                env = {**os.environ, "WINEFORGE_DIR": str(FORGE)}
+                subprocess.Popen([sys.executable, str(FORGE / "bin" / "wineforge"),
+                                  "run", name], env=env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+                zt("--info", "--title=WineForge", "--timeout=3",
+                   f"--text=Zaganjam <b>{name}</b> ...")
+        elif c.startswith("Nastavi velikost"):
+            name = _app_menu("Nastavi velikost vmesnika")
+            if not name:
+                continue
+            code, pct = zt("--scale", "--title=Velikost vmesnika", "--value=150",
+                           "--min-value=50", "--max-value=300", "--step=5",
+                           "--text=Kako velik vmesnik? (100 = normalno, 150 = večje)")
+            if code != 0:
+                continue
+            code2, out2 = _wf("scale", name, str(int(float(pct.strip() or 150))),
+                              progress_msg="Nastavljam velikost ...")
+            _show("Velikost vmesnika", out2)
+        elif c.startswith("Popravi"):
+            name = _app_menu("Popravi program")
+            if not name:
+                continue
+            code, out = zt("--question", "--title=Popravi",
+                           f"--text=Obnovim podatke iz varnostne kopije za <b>{name}</b>?\n"
+                           "(Če ne veš, izberi Ne — ponastavi se samo WebView2.)",
+                           "--ok-label=Obnovi podatke", "--cancel-label=Samo WebView2")
+            code2, out2 = _wf("repair", name, *(["--restore"] if code == 0 else []),
+                              progress_msg="Popravljam ...")
+            _show("Popravilo", out2)
+        elif c.startswith("Naredi"):
+            name = _app_menu("Prenosni paket")
+            if not name:
+                continue
+            code, folder = zt("--file-selection", "--directory",
+                              "--title=Kam shranim paket?")
+            if code != 0:
+                continue
+            code2, out2 = _wf("pack", name, "--out", folder.strip(), "--force",
+                              progress_msg=f"Pakiram {name} ...")
+            _show("Pakiranje", out2)
+        elif c.startswith("Odpri"):
+            subprocess.Popen(["xdg-open", str(APPS)])
+        elif c.startswith("Diagnoza"):
+            code, out = _wf("doctor", progress_msg="Preverjam motor, GPU in CUDA ...")
+            _show("Diagnoza", out)
+        else:
+            return 0
+
+
+def cmd_shortcut(args):
+    """Ustvari .desktop bližnjico za aplikacijo."""
+    meta = app_load(args.name)
+    if not meta:
+        die(f"Neznana aplikacija: {args.name}")
+    desk = Path.home() / ".local/share/applications"
+    desk.mkdir(parents=True, exist_ok=True)
+    p = desk / f"wineforge-{slugify(args.name)}.desktop"
+    p.write_text(f"""[Desktop Entry]
+Type=Application
+Name={meta['name']} (Wine)
+Comment=Windows program prek WineForge
+Exec={FORGE}/bin/wineforge run {args.name}
+Icon=wine
+Terminal=false
+Categories=Wine;
+StartupNotify=true
+""")
+    p.chmod(0o755)
+    log(f"Bližnjica: {p}")
+    return 0
+
+# --------------------------------------------------------------- ukazi ------
+
+def cmd_list(args):
+    apps = app_list()
+    if not apps:
+        log("Ni še nobene aplikacije. Dodaj jo z: wineforge add <ime> --exe <pot>")
+        return 0
+    print(f"{'ime':<24}{'prefix':<20}{'exe'}")
+    for a in apps:
+        print(f"{a['name']:<24}{(a.get('prefix') or '-'):<20}{a.get('exe')}")
+    return 0
+
+
+def cmd_add(args):
+    exe = Path(args.exe).expanduser().resolve()
+    if not exe.exists():
+        die(f"Ne obstaja: {exe}")
+    name = args.name or slugify(exe.stem)
+    prefix = args.prefix or name
+    p = prefix_path(prefix)
+    if not (p / "system.reg").exists():
+        prefix_new(prefix, quiet=True)
+    includes = []
+    for spec in (args.include or []):
+        src, _, win = spec.partition(":")
+        includes.append({"src": str(Path(src).expanduser().resolve()),
+                         "win": win or "Apps"})
+    exe_win = None
+    for inc in includes:
+        src = Path(inc["src"])
+        try:
+            rel = exe.relative_to(src)
+        except ValueError:
+            continue
+        exe_win = inc["win"].replace("/", "\\") + "\\" + str(rel).replace("/", "\\")
+        break
+    meta = {
+        "name": name,
+        "exe": str(exe),
+        "exe_win": exe_win,
+        "prefix": str(p),
+        "include": includes,
+        "sys32": [],
+        "args": args.args or [],
+        "env": {},
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    app_save(meta)
+    auto_scale(name, meta)
+    log(f"Dodano: {name}  (zaženi: wineforge run {name})")
+    return 0
+
+
+def cmd_run(args):
+    code = app_run(args.name, args.args, debug=args.debug)
+    if code and code != 0:
+        warn("Namig: če se okno prikaže prazno/belo, poženi: wineforge repair " + args.name)
+    return code
+
+
+def cmd_repair(args):
+    """Obnovi aplikacijo po okvari (belo okno, pokvarjeni podatki, WebView2)."""
+    meta = app_load(args.name)
+    if not meta:
+        die(f"Aplikacija '{args.name}' ne obstaja.")
+    prefix = Path(meta.get("prefix") or prefix_path(args.name))
+    if not prefix.exists():
+        die(f"Prefix ne obstaja: {prefix}")
+    wineserver_kill(prefix)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dc = prefix / "drive_c"
+    local = dc / "users"
+    changed = False
+
+    # 1) seznam vseh map s podatki aplikacij (AppData\Local, AppData\Roaming)
+    data_roots = []
+    for userdir in sorted(local.glob("*")):
+        for sub in ("AppData/Local", "AppData/Roaming", "Application Data"):
+            d = userdir / sub
+            if d.is_dir():
+                data_roots.append(d)
+
+    # 2) varnostne kopije tipa <mapa>-Backup...  -> ponudi obnovitev
+    backups = []
+    for root in data_roots:
+        for d in sorted(root.glob("*-Backup*")):
+            if d.is_dir():
+                backups.append(d)
+    if backups and not args.restore and not args.list_backups:
+        warn("Najdene varnostne kopije podatkov (okvarjena mapa):")
+        for b in backups:
+            log(f"    {b.relative_to(dc)}")
+        warn("Za obnovitev: wineforge repair %s --restore" % args.name)
+
+    # 3) obnovitev: zamenjaj prazno/okvarjeno mapo z vsebino varnostne kopije
+    if args.restore:
+        target = None
+        if args.restore is not True and str(args.restore) not in ("True", "true"):
+            for b in backups:
+                if str(args.restore) in b.name:
+                    target = b
+                    break
+            if target is None:
+                die(f"Varnostna kopija '{args.restore}' ne obstaja.")
+        elif backups:
+            target = max(backups, key=lambda p: p.stat().st_mtime)
+        if target is None:
+            warn("Ni najdenih varnostnih kopij za obnovitev.")
+        else:
+            orig = Path(str(target))
+            name = target.name
+            base = re.sub(r"-Backup.*$", "", name)
+            dest = target.parent / base
+            if dest.exists():
+                old = dest.with_name(base + ".broken-" + ts)
+                step(f"Obstoječa mapa -> {old.name}")
+                dest.rename(old)
+            step(f"Obnavljam {name} -> {base}")
+            target.rename(dest)
+            changed = True
+
+    # 4) ponastavitev WebView2/Chromium profilov (reši belo okno)
+    if args.list_backups:
+        return 0
+
+    if not args.no_webview:
+        for root in data_roots:
+            for pat in ("*/*/EBWebView", "*/EBWebView", "*/*/WebView2", "*/WebView2",
+                        "*/*/Microsoft/EdgeWebView", "*/Microsoft/EdgeWebView"):
+                for d in root.glob(pat):
+                    if d.is_dir() and ".bak-" not in d.name:
+                        new = d.with_name(d.name + ".bak-" + ts)
+                        step(f"WebView2 profil -> {new.name}")
+                        try:
+                            d.rename(new)
+                            changed = True
+                        except OSError as e:
+                            warn(f"  ne morem preimenovati: {e}")
+
+    # 5) počisti Temp znotraj prefixa
+    if args.clean_temp:
+        for t in dc.glob("users/*/AppData/Local/Temp/*"):
+            try:
+                if t.is_dir():
+                    shutil.rmtree(t, ignore_errors=True)
+                else:
+                    t.unlink()
+            except OSError:
+                pass
+        step("Temp počiščen")
+        changed = True
+
+    if changed:
+        log("")
+        log("Popravljeno. Zaženi: wineforge run " + args.name)
+    else:
+        log("Ni bilo česa popraviti.")
+    log("Namig: aplikacije NE ubijaj s 'kill -9' — zapri okno (ali Ctrl+Q),")
+    log("      sicer se podatki aplikacije lahko pokvarijo in okno ostane belo.")
+    return 0
+
+
+def cmd_prefix(args):
+    if args.action == "list":
+        for p in list_prefixes():
+            log(f"  {p}  ({human(du(PREFIXES / p))})")
+        return 0
+    if args.action == "new":
+        prefix_new(args.name)
+        return 0
+    if args.action == "delete":
+        p = prefix_path(args.name)
+        wineserver_kill(p)
+        if p.exists():
+            shutil.rmtree(p)
+            log(f"Izbrisan prefix {p}")
+        return 0
+    if args.action == "shell":
+        p = prefix_path(args.name)
+        env = wine_env(p)
+        log(f"Prefix {p} — 'wine <program>' za zagon, 'exit' za izhod")
+        subprocess.run([os.environ.get("SHELL", "/bin/bash")], env={**os.environ, **env})
+        return 0
+    if args.action == "explorer":
+        p = prefix_path(args.name)
+        wine(["explorer", "/desktop=shell,1024x768", r"C:\windows"], prefix=p)
+        return 0
+    if args.action == "tweaks":
+        p = prefix_path(args.name)
+        setup_defaults(p)
+        log("Privzeti override-i in nastavitve ponovno uporabljeni")
+        return 0
+    die("neznano dejanje")
+
+
+def cmd_deps(args):
+    target = Path(args.target).expanduser()
+    if not target.exists():
+        die(f"Ne obstaja: {target}")
+    step(f"Analiza: {target}")
+    found, archs = scan_deps(target)
+    log(f"  arhitekture: {', '.join(sorted(archs)) or '?'}")
+    if not found:
+        log("  ni zaznanih posebnih odvisnosti (samo sistemske Windows knjižnice)")
+        return 0
+    for comp, dlls in sorted(found.items()):
+        log(f"  {comp:<18} <- {', '.join(sorted(dlls))}")
+    if args.install:
+        die("samodejno nameščanje komponent še ni implementirano v tej različici")
+    return 0
+
+
+def cmd_doctor_public(args):
+    return cmd_doctor(args)
+
+
+def cmd_info(args):
+    log(f"WineForge {VERSION}")
+    log(f"  motor:  {FORGE}")
+    log(f"  wine:   {WINE}")
+    log(f"  appi:   {len(app_list())}")
+    log(f"  prefixi:{len(list_prefixes())}")
+    log(f"  velikost: {human(du(FORGE))}")
+    return 0
+
+
+# ------------------------------------------------------------------ main ----
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="wineforge", description="Prenosni Wine motor")
+    p.add_argument("--version", action="version", version=f"WineForge {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("bake", help="zgradi predlogo prefixa z vsemi komponentami")
+    s.add_argument("name", nargs="?")
+    s.add_argument("--resume", action="store_true", help="nadaljuj prekinjeno peko")
+    s.add_argument("--keep-going", action="store_true", help="ne ustavi ob napaki")
+    s.add_argument("--no-pack", action="store_true", help="ne pakiraj predloge")
+    s.add_argument("--with-dotnet", action="store_true", help="vkljuci .NET 4.8 in .NET 8")
+    s.set_defaults(func=cmd_bake)
+
+    s = sub.add_parser("doctor", help="preveri delovanje motorja, GPU, CUDA")
+    s.set_defaults(func=cmd_doctor)
+
+    s = sub.add_parser("info", help="osnovne informacije")
+    s.set_defaults(func=cmd_info)
+
+    s = sub.add_parser("list", help="seznam aplikacij")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("add", help="dodaj Windows aplikacijo")
+    s.add_argument("name", nargs="?")
+    s.add_argument("--exe", required=True)
+    s.add_argument("--prefix")
+    s.add_argument("--include", action="append", metavar="POT[:WINMAPA]",
+                   help="celotna mapa programa, npr. /pot/do/App:Apps/App")
+    s.add_argument("--args", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("run", help="zaženi aplikacijo")
+    s.add_argument("name")
+    s.add_argument("--debug", action="store_true")
+    s.add_argument("args", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("config", help="nastavitve motorja (samodejno skaliranje)")
+    s.add_argument("--electron-scale", type=float, help="privzeto 1.5 (npr. 1.25, 1.75)")
+    s.add_argument("--win32-dpi-scale", type=float, help="privzeto 1.0 (npr. 1.25)")
+    s.add_argument("--auto-scale", choices=["on", "off"])
+    s.set_defaults(func=cmd_config)
+
+    s = sub.add_parser("scale", help="nastavi velikost vmesnika (DPI/zoom)")
+    s.add_argument("name")
+    s.add_argument("percent", type=int, help="npr. 100, 125, 150, 175, 200")
+    s.set_defaults(func=cmd_scale)
+
+    s = sub.add_parser("gui", help="grafični vmesnik (zenity) — kot WineCharm")
+    s.set_defaults(func=cmd_gui)
+
+    s = sub.add_parser("shortcut", help="ustvari bližnjico v meniju")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_shortcut)
+
+    s = sub.add_parser("repair", help="popravi aplikacijo (belo okno, pokvarjeni podatki)")
+    s.add_argument("name")
+    s.add_argument("--restore", nargs="?", const=True, default=None,
+                   help="obnovi podatke iz varnostne kopije (*-Backup*)")
+    s.add_argument("--list-backups", action="store_true")
+    s.add_argument("--no-webview", action="store_true", help="ne ponastavi WebView2 profila")
+    s.add_argument("--clean-temp", action="store_true")
+    s.set_defaults(func=cmd_repair)
+
+    s = sub.add_parser("prefix", help="upravljanje s prefixi")
+    s.add_argument("action", choices=["list", "new", "delete", "shell", "explorer", "tweaks"])
+    s.add_argument("name", nargs="?")
+    s.set_defaults(func=cmd_prefix)
+
+    s = sub.add_parser("install", help="namesti program in naredi prenosno aplikacijo")
+    s.add_argument("installer")
+    s.add_argument("--name")
+    s.add_argument("--exe", help="glavni exe (relativna pot znotraj namestitve)")
+    s.add_argument("--interactive", action="store_true", help="namesti ročno (GUI)")
+    s.add_argument("--args", nargs=argparse.REMAINDER)
+    s.add_argument("--keep-staging", action="store_true",
+                   help="obdrži začasni prefix (za diagnozo)")
+    s.set_defaults(func=cmd_install)
+
+    s = sub.add_parser("pack", help="naredi samostojen prenosni paket")
+    s.add_argument("name")
+    s.add_argument("--out", default=str(FORGE / "dist"))
+    s.add_argument("--compress", action="store_true")
+    s.add_argument("--no-prefix", action="store_true")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(func=cmd_pack)
+
+    s = sub.add_parser("remove", help="odstrani aplikacijo")
+    s.add_argument("name")
+    s.add_argument("--keep-prefix", action="store_true")
+    s.set_defaults(func=cmd_remove)
+
+    s = sub.add_parser("deps", help="analiza odvisnosti PE datotek")
+    s.add_argument("target")
+    s.add_argument("--install", action="store_true")
+    s.set_defaults(func=cmd_deps)
+
+    return p
+
+
+def main(argv=None):
+    for d in (PREFIXES, APPS, DATA, LOGS, TEMPLATES, DEPS):
+        d.mkdir(parents=True, exist_ok=True)
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if not getattr(args, "func", None):
+        ap.print_help()
+        return 0
+    return args.func(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
