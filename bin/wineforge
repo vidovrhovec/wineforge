@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import signal
+import tempfile
 import struct
 import subprocess
 import sys
@@ -1020,9 +1021,16 @@ def detect_installer(path):
     return "unknown", []
 
 
-def _popen_stream(cmd, env=None):
-    """Požene ukaz z živim izpisom in zbira vrstice (za povzetek napak po teku)."""
+def _popen_stream(cmd, env=None, log_path=None):
+    """Požene ukaz z živim izpisom, zbira vrstice in (če je podan) piše dnevnik."""
     lines = []
+    fh = None
+    if log_path:
+        try:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            fh = open(log_path, "w", encoding="utf-8", errors="replace")
+        except OSError:
+            fh = None
     p = subprocess.Popen(cmd, env=env, text=True, bufsize=1,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          errors="replace")
@@ -1031,6 +1039,9 @@ def _popen_stream(cmd, env=None):
             sys.stdout.write(line)
             sys.stdout.flush()
             lines.append(line)
+            if fh:
+                fh.write(line)
+                fh.flush()
     except KeyboardInterrupt:
         pass
     finally:
@@ -1038,6 +1049,8 @@ def _popen_stream(cmd, env=None):
             p.stdout.close()
         except Exception:
             pass
+        if fh:
+            fh.close()
     return p.wait(), lines
 
 
@@ -1088,10 +1101,13 @@ def cmd_install(args):
 
     step("Nameščam program")
     cmd = [str(WINE), str(inst)] + (silent if not args.interactive else [])
+    LOGS.mkdir(parents=True, exist_ok=True)
+    install_log = LOGS / f"install-{name}-{time.strftime('%Y%m%d-%H%M%S')}.log"
     # err/warn morata videti: brez tega povzetek napak po namestitvi ne gre
     env = {**os.environ, **wine_env(staging, {"WINEDEBUG": "err+all,warn+all"})}
-    code, out_lines = _popen_stream(cmd, env=env)
+    code, out_lines = _popen_stream(cmd, env=env, log_path=install_log)
     _summarize_install_errors(out_lines)
+    log(f"  dnevnik namestitve: {install_log}")
     wineserver_kill(staging)
     wait_wineserver(staging, 30)
 
@@ -2117,6 +2133,18 @@ def _zt_kdialog(argv, input=None):
 
     title = opt("--title") or "WineForge"
     text = opt("--text") or title
+    if "--text-info" in argv:
+        # kdialog nima --text-info: zapišemo v začasno datoteko -> --textbox
+        w = opt("--width") or "760"
+        h = opt("--height") or "520"
+        tmp = Path(tempfile.gettempdir()) / f"wineforge-{os.getpid()}.txt"
+        tmp.write_text(input or "", encoding="utf-8", errors="replace")
+        try:
+            run(["kdialog", "--title", title, "--textbox", str(tmp), w, h],
+                capture=True)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return 0, ""
     if "--question" in argv:
         code, _out = run(["kdialog", "--title", title, "--yesno", text], capture=True)
         return (0 if code == 0 else 1, "")
@@ -2188,8 +2216,7 @@ def zt(*args, input=None):
             elif a == "--file-selection":
                 # yad 15 nima --file-selection: način izbire datoteke je --file
                 fixed.append("--file")
-            elif a.startswith("--font="):
-                fixed.append("--fontname=" + a.split("=", 1)[1])
+            elif a.startswith("--font="):                fixed.append("--fontname=" + a.split("=", 1)[1])
             elif a.startswith("--ok-label="):
                 fixed.append("--button=" + a.split("=", 1)[1] + ":0")
             elif a.startswith("--cancel-label="):
@@ -2203,6 +2230,8 @@ def zt(*args, input=None):
         argv, inp = fixed, (text if text is not None else input)
     else:
         inp = input
+        # zenity ne pozna --wrap/--tail (sam prelamlja); yad ju potrebuje
+        argv = [a for a in argv if a not in ("--wrap", "--tail")]
     p = subprocess.run([tool, *argv], text=True, input=inp,
                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                        env=os.environ.copy())
@@ -2244,9 +2273,21 @@ def _ask(title, text, default=""):
     return out.strip() if code == 0 else None
 
 
-def _show(title, text, width=700, height=460):
-    zt("--text-info", f"--title={title}", f"--width={width}", f"--height={height}",
-       "--font=monospace", input=text)
+def _show(title, text, width=760, height=520, log=None):
+    """Okno z izpisom. --wrap = dolge vrstice se prelomijo (yad jih sicer odreže),
+    --tail = prikaže se KONEC izpisa (tam so napake)."""
+    args = ["--text-info", f"--title={title}", f"--width={width}",
+            f"--height={height}", "--font=monospace", "--wrap"]
+    nlines = text.count("\n")
+    if nlines > 25:
+        args.append("--tail")
+    if log:
+        args.append("--button=Odpri dnevnik:2")
+    code, _out = zt(*args, input=text)
+    if code == 2 and log:
+        subprocess.Popen(["xdg-open", str(log)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return code
 
 
 def _app_menu(title):
@@ -2284,6 +2325,7 @@ def cmd_gui(args):
                           "Nastavi velikost vmesnika (DPI/zoom)",
                           "Naredi prenosni paket (USB)",
                           "Odpri mapo programov",
+                          "Odpri dnevnike (napake pri namestitvi)",
                           "Diagnoza (Wine, GPU, CUDA)",
                           "Zapri")
         if code != 0 or not choice.strip():
@@ -2310,7 +2352,9 @@ def cmd_gui(args):
                 continue
             code, out = _wf("install", inst, "--name", name,
                             progress_msg=f"Nameščam {Path(inst).name} ...\nTo lahko traja nekaj minut.")
-            _show("Namestitev", out)
+            m = re.search(r"dnevnik namestitve: (\S+)", out)
+            log_path = m.group(1) if m else None
+            _show("Namestitev — " + name, out, log=log_path)
         elif c.startswith("Zaženi"):
             name = _app_menu("Zaženi program")
             if name:
@@ -2355,8 +2399,11 @@ def cmd_gui(args):
             code2, out2 = _wf("pack", name, "--out", folder.strip(), "--force",
                               progress_msg=f"Pakiram {name} ...")
             _show("Pakiranje", out2)
-        elif c.startswith("Odpri"):
+        elif c.startswith("Odpri mapo"):
             subprocess.Popen(["xdg-open", str(APPS)])
+        elif c.startswith("Odpri dnevnike"):
+            LOGS.mkdir(parents=True, exist_ok=True)
+            subprocess.Popen(["xdg-open", str(LOGS)])
         elif c.startswith("Diagnoza"):
             code, out = _wf("doctor", progress_msg="Preverjam motor, GPU in CUDA ...")
             _show("Diagnoza", out)
