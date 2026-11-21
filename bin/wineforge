@@ -1544,6 +1544,9 @@ ENGINE_RELEASE = "0.1.0"
 ENGINE_BUNDLE = f"engine-{ENGINE_RELEASE}.tar.zst"
 ENGINE_URL = (f"https://github.com/vidovrhovec/wineforge/releases/download/"
               f"engine-{ENGINE_RELEASE}/{ENGINE_BUNDLE}")
+# sha256 zaklenjene izdaje; ju SKUPAJ spremenimo ob novem bundlu
+# (vrednost preveri s: sha256sum engine-0.1.0.tar.zst / gh release view)
+ENGINE_SHA256 = "fcb19b1e36e5f19832947f6149d7754a31f1e0c0d4154193964c87e93206c20e"
 MANIFEST = DATA / "engine-manifest.json"
 
 CABEXTRACT = TOOLSBIN / "cabextract"
@@ -1675,7 +1678,7 @@ def _setup_bundle(offline=False):
         return True
     dest = DEPS / ENGINE_BUNDLE
     try:
-        download(ENGINE_URL, dest, offline=offline)
+        download(ENGINE_URL, dest, sha256=ENGINE_SHA256, offline=offline)
     except RuntimeError as e:
         warn(f"paket {ENGINE_BUNDLE} ni na voljo ({e}) — sestavim motor iz delov")
         return False
