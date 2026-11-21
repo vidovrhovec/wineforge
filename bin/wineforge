@@ -2141,6 +2141,9 @@ def zt(*args, input=None):
         for a in argv:
             if a == "--hide-header":
                 fixed.append("--no-headers")
+            elif a == "--file-selection":
+                # yad 15 nima --file-selection: način izbire datoteke je --file
+                fixed.append("--file")
             elif a.startswith("--font="):
                 fixed.append("--fontname=" + a.split("=", 1)[1])
             elif a.startswith("--ok-label="):
