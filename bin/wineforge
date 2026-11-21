@@ -745,7 +745,10 @@ def bake_state_save(st):
 
 
 def winetricks(prefix, *args, extra_env=None, timeout=None):
-    env = wine_env(prefix, extra_env)
+    # OKOLJE MORA OHRANITI gostitelja (DISPLAY, HOME, XDG_RUNTIME_DIR, ...):
+    # brez teh spremenljivk vcredist/winetricks namestitve spodletijo.
+    env = dict(os.environ)
+    env.update(wine_env(prefix, extra_env))
     env.update({
         "PATH": f"{WINE_DIR / 'bin'}:{os.environ.get('PATH', '')}",
         "W_CACHE": str(SHARE / "verbs"),
