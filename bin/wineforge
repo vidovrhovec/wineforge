@@ -1020,6 +1020,48 @@ def detect_installer(path):
     return "unknown", []
 
 
+def _popen_stream(cmd, env=None):
+    """Požene ukaz z živim izpisom in zbira vrstice (za povzetek napak po teku)."""
+    lines = []
+    p = subprocess.Popen(cmd, env=env, text=True, bufsize=1,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         errors="replace")
+    try:
+        for line in p.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            lines.append(line)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            p.stdout.close()
+        except Exception:
+            pass
+    return p.wait(), lines
+
+
+def _summarize_install_errors(lines):
+    """Po namestitvi povzame Wine/storitvene napake ('err:') iz izpisa."""
+    bad = [l.strip() for l in lines if ":err:" in l]
+    if not bad:
+        return
+    warn(f"namestitev je zabeležila {len(bad)} vrstic z napakami Wine/storitev:")
+    shown, rest = [], 0
+    for i, l in enumerate(bad):
+        key = re.sub(r"^\w*:\w+:", "", l).strip()[:140]
+        if key not in shown:
+            shown.append(key)
+            log("   " + key)
+        if len(shown) >= 8:
+            rest = len(bad) - i - 1
+            break
+    if rest:
+        log(f"   ... in še {rest} vrstic z napakami")
+    warn("  pomeni: nekateri koraki (storitve/PowerShell/skripte) NISO delovali, zato bo\n"
+         "  program po zagonu utegnil prikazati napako — glej vrstice zgoraj.")
+
+
 def cmd_install(args):
     """Namesti program v začasen prefix, zajame spremembe in naredi prenosno aplikacijo."""
     inst = Path(args.installer).expanduser().resolve()
@@ -1046,8 +1088,10 @@ def cmd_install(args):
 
     step("Nameščam program")
     cmd = [str(WINE), str(inst)] + (silent if not args.interactive else [])
-    env = {**os.environ, **wine_env(staging, {"WINEDEBUG": "-all"})}
-    p = subprocess.run(cmd, env=env)
+    # err/warn morata videti: brez tega povzetek napak po namestitvi ne gre
+    env = {**os.environ, **wine_env(staging, {"WINEDEBUG": "err+all,warn+all"})}
+    code, out_lines = _popen_stream(cmd, env=env)
+    _summarize_install_errors(out_lines)
     wineserver_kill(staging)
     wait_wineserver(staging, 30)
 
@@ -2344,6 +2388,16 @@ def cmd_add(args):
     if not exe.exists():
         die(f"Ne obstaja: {exe}")
     name = args.name or slugify(exe.stem)
+    # opozori, če je izbrana datoteka dejansko NAMESTITVENIK (ne program):
+    try:
+        kind, _silent = detect_installer(exe)
+    except Exception:
+        kind = "unknown"
+    if kind != "unknown":
+        warn(f"'{exe.name}' je videti kot NAMESTITVENI program ({kind}) — ne kot razširjen program.")
+        warn("  'add' predvideva, da program že leži v mapi; sicer vsak zagon\n"
+             "  znova zžene namestitev. Zdaj je vnos dodan kot je, uporabi pa:\n"
+             f"    wineforge install \"{exe}\" --name {name}")
     prefix = args.prefix or name
     p = prefix_path(prefix)
     if not (p / "system.reg").exists():

@@ -129,6 +129,17 @@ Zahteve: 64-bit Linux, glibc ≥ 2.31, Vulkan gonilnik. Za CUDA: NVIDIA gonilnik
 
 ## Znane pasti
 
+* **Storitve, PowerShell in gonilniki:** Wine nima pravega Windows upravitelja
+  storitev in njegov `powershell.exe` je samo "stub". Namestitveni programi,
+  ki med namestitvijo kličejo PowerShell skripte ali speljejo lastne storitve
+  (npr. StarDesk), zato pri namestitvi zabeležijo `err:` vrstice — program se
+  **namesti, a pri zagonu pokaže napako** (manjka config/storitev).
+  `install` zato po namestitvi izpiše povzetek grešn: če ga vidiš, je vzrok
+  za napako aplikacije pogosto tam, ne v WineForge.
+* **"Dodaj" ni "Namesti":** če v `add` izbereš namestitveni `.exe`, ga WineForge
+  le registrira vsak zagon bo znova zagnal namestitev. Za installer-je uporabi
+  `install` (v GUI-ju: "Namesti program").
+
 * **Ne ubijaj aplikacije s `kill -9`** — WebView2/Chromium aplikacije ob tem
   izgubijo/pokvarijo podatke in okno ostane belo. Zapri z X ali Ctrl+Q;
   za popravilo: `wineforge repair <app>`.
