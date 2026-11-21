@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -768,13 +769,15 @@ def winetricks(prefix, *args, extra_env=None, timeout=None):
     return p.returncode, p.stdout
 
 
-def download(url, dest, quiet=True, sha256=None):
+def download(url, dest, quiet=True, sha256=None, offline=False):
     dest = Path(dest)
     if dest.exists() and dest.stat().st_size > 0:
         if not sha256 or _sha256(dest) == (sha256 or "").lower():
             return dest
         warn(f"sha256 ne ustreza, ponovno prenašam: {dest.name}")
         dest.unlink()
+    if offline:
+        raise RuntimeError(f"--offline in ni v predpomnilniku: {dest.name}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     step(f"Prenašam {dest.name}")
@@ -870,6 +873,8 @@ def cmd_bake(args):
             except OSError:
                 pass
     materialize_nvidia(prefix)
+    if getattr(args, "compact", False):
+        _bake_compact(prefix)
     if args.no_pack:
         log("Predloga pripravljena (brez pakiranja)")
         return 0
@@ -882,6 +887,35 @@ def cmd_bake(args):
     tmp.replace(BASE_TEMPLATE)
     log(f"Predloga: {BASE_TEMPLATE} ({human(BASE_TEMPLATE.stat().st_size)})")
     return 0
+
+
+def _bake_compact(prefix):
+    """bake --compact: odstrani pomoč, Installer cache, dnevnike, pdb-je.
+    Opozorilo: brez windows/Installer ne deluje popravljanje prek Kontrolne plošče."""
+    step("Kompaktna predloga: odstranjujem pomoč, Installer cache, dnevnike ...")
+    before = du(Path(prefix))
+    victims = []
+    for pat in ("drive_c/windows/Installer/*", "drive_c/windows/Help",
+                "drive_c/windows/*.log", "drive_c/windows/*.tmp",
+                "drive_c/users/*/Temp/*", "drive_c/windows/temp/*"):
+        victims.extend(p for p in Path(prefix).glob(pat))
+    for root, _dirs, files in os.walk(Path(prefix) / "drive_c"):
+        for f in files:
+            if f.endswith((".pdb", ".chm", ".bak", ".old")):
+                victims.append(Path(root) / f)
+    removed = freed = 0
+    for v in victims:
+        try:
+            freed += v.stat().st_size if v.is_file() else 0
+            if v.is_dir():
+                shutil.rmtree(v, ignore_errors=True)
+            else:
+                v.unlink()
+            removed += 1
+        except OSError:
+            pass
+    log(f"  odstranjeno {removed} postavk, prihranjeno ~{human(freed)} "
+        f"(predloga {human(before)} -> {human(du(Path(prefix)))})")
 
 
 def materialize_nvidia(prefix):
@@ -1089,6 +1123,9 @@ def cmd_install(args):
     auto_scale(name, meta)
     log(f"\nAplikacija '{name}' pripravljena. Zaženi: wineforge run {name}")
     log(f"Velikost: {human(du(adir))}   (prefix se ustvari ob prvem zagonu)")
+    if not getattr(args, "no_shortcut", False):
+        for p in _desktop_write(name, places=("menu", "desktop")):
+            log(f"Ikona (klik): {p}")
     return 0
 
 
@@ -1278,6 +1315,9 @@ exec "$HERE/bin/wineforge" desktop "{args.name}"
 ''')
     reg.chmod(0o755)
     (out / "README.txt").write_text(README_TXT.format(name=args.name))
+    if getattr(args, "desktop", False):
+        step("Ustvarjam ikono za paket (kaže na to mapo — ok, če se premika)")
+        run([str(out / "bin" / "wineforge"), "desktop", args.name])
     total = du(out)
     log(f"Paket: {out}  ({human(total)})")
     if args.compress:
@@ -1303,6 +1343,39 @@ def cmd_remove(args):
     return 0
 
 
+def _doctor_fix():
+    """doctor --fix: popravi, kar se da popraviti brez vprašanj."""
+    step("doctor --fix — popravljam")
+    if setup_missing():
+        cmd_setup(_ns_setup())
+    for name in list_prefixes():
+        p = prefix_path(name)
+        if not (p / "system.reg").exists():
+            continue
+        log(f"  {name}: ustavim wineserver, čistim temp, obnovim override-e")
+        wineserver_kill(p)
+        wait_wineserver(p, 15)
+        for pat in ("drive_c/users/*/Temp/*", "drive_c/windows/temp/*",
+                    "drive_c/users/*/AppData/Local/Temp/*", "drive_c/windows/*.log"):
+            for f in p.glob(pat):
+                try:
+                    shutil.rmtree(f) if f.is_dir() else f.unlink()
+                except OSError:
+                    pass
+        setup_defaults(p, quiet=True)
+    log(f"  {len(list_prefixes())} prefixov pregledanih")
+    step("Popravljeno. Ponovno preveri: wineforge doctor")
+
+
+def _doctor_cleanup():
+    """Začasni _doctor prefix odstrani (ne rabi ~1,5 GB)."""
+    p = prefix_path("_doctor")
+    if (p / "system.reg").exists():
+        wineserver_kill(p)
+        wait_wineserver(p, 5)
+        shutil.rmtree(p, ignore_errors=True)
+
+
 def cmd_doctor(args):
     step("WineForge doctor")
     ok = True
@@ -1313,6 +1386,9 @@ def cmd_doctor(args):
         if good is False:
             ok = False
         print(f" {mark} {label:<28} {value}")
+
+    if getattr(args, "fix", False):
+        _doctor_fix()
 
     line("motor", str(FORGE))
     if WINE.exists():
@@ -1356,6 +1432,8 @@ def cmd_doctor(args):
                     break
             line("CUDA v Wine", (dev or ("ok" if has else "ne dela")), has)
     log()
+    if not getattr(args, "keep_prefix", False):
+        _doctor_cleanup()
     return 0 if ok else 1
 
 
@@ -1460,6 +1538,14 @@ WT_URL = ("https://raw.githubusercontent.com/Winetricks/winetricks/"
 CAB_URL = ("https://archive.archlinux.org/packages/c/cabextract/"
            "cabextract-1.11-3-x86_64.pkg.tar.zst")
 
+# "en prenos": engine/ + predloga skupaj (GitHub Release) — na novem
+# računalniku potem ničesar več ni treba peči/prenašati posamično.
+ENGINE_RELEASE = "0.1.0"
+ENGINE_BUNDLE = f"engine-{ENGINE_RELEASE}.tar.zst"
+ENGINE_URL = (f"https://github.com/vidovrhovec/wineforge/releases/download/"
+              f"engine-{ENGINE_RELEASE}/{ENGINE_BUNDLE}")
+MANIFEST = DATA / "engine-manifest.json"
+
 CABEXTRACT = TOOLSBIN / "cabextract"
 ICON_NAME = "wineforge"
 ICON_SRC = SHARE / "icons" / f"{ICON_NAME}.svg"
@@ -1505,7 +1591,7 @@ def _sha256_release():
         return {}
 
 
-def _setup_wine():
+def _setup_wine(offline=False):
     if os.access(WINE, os.X_OK):
         return
     machine = os.uname().machine
@@ -1513,7 +1599,8 @@ def _setup_wine():
         die(f"WineForge potrebuje 64-bitni x86_64 (tvoj: {machine})")
     fname = WINE_BUILD + ".tar.xz"
     step(f"Prenašam Wine {WINE_VER} (prenosljiv, ~100 MB)")
-    dest = download(WINE_URL, DEPS / fname, sha256=_sha256_release().get(fname))
+    sums = {} if offline else _sha256_release()
+    dest = download(WINE_URL, DEPS / fname, sha256=sums.get(fname), offline=offline)
     step("Razpakiram engine/wine ...")
     work = DEPS / "wine-untar"
     shutil.rmtree(work, ignore_errors=True)
@@ -1531,11 +1618,11 @@ def _setup_wine():
     shutil.rmtree(work, ignore_errors=True)
 
 
-def _setup_nvidialibs():
+def _setup_nvidialibs(offline=False):
     if (NVLIBS / "x64" / "nvcuda.dll").exists():
         return
     step("Prenašam nvidia-libs (CUDA/NVML/NVAPI, ~3 MB)")
-    dest = download(NVL_URL, DEPS / "nvidia-libs.tar.xz")
+    dest = download(NVL_URL, DEPS / "nvidia-libs.tar.xz", offline=offline)
     work = DEPS / "nvl-untar"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
@@ -1550,22 +1637,22 @@ def _setup_nvidialibs():
     shutil.rmtree(work, ignore_errors=True)
 
 
-def _setup_winetricks():
+def _setup_winetricks(offline=False):
     if os.access(TOOLS / "winetricks", os.X_OK):
         return
     step("Prenašam winetricks")
     TOOLS.mkdir(parents=True, exist_ok=True)
-    download(WT_URL, TOOLS / "winetricks")
+    download(WT_URL, TOOLS / "winetricks", offline=offline)
     (TOOLS / "winetricks").chmod(0o755)
 
 
-def _setup_cabextract():
+def _setup_cabextract(offline=False):
     if cabextract_bin():
         return
     # sistemskega ne moremo nameščati (brez roota) → prenosni v engine/tools/bin
     step("Prenašam prenosni cabextract")
     pkg = DEPS / "cabextract.pkg.tar.zst"
-    download(CAB_URL, pkg)
+    download(CAB_URL, pkg, offline=offline)
     work = DEPS / "cabextract-untar"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
@@ -1582,39 +1669,181 @@ def _setup_cabextract():
     shutil.rmtree(work, ignore_errors=True)
 
 
+def _setup_bundle(offline=False):
+    """Najprej poskuša EN prenos: engine/ + share/templates/ (GitHub Release)."""
+    if os.access(WINE, os.X_OK) and BASE_TEMPLATE.exists():
+        return True
+    dest = DEPS / ENGINE_BUNDLE
+    try:
+        download(ENGINE_URL, dest, offline=offline)
+    except RuntimeError as e:
+        warn(f"paket {ENGINE_BUNDLE} ni na voljo ({e}) — sestavim motor iz delov")
+        return False
+    step("Razpakiram paket engine + predloga (en prenos) ...")
+    code, out = run(["tar", "--zstd", "-xf", str(dest), "-C", str(FORGE)],
+                    capture=True)
+    if code:
+        warn("razpakiranje paketa ni uspelo:\n" + out[-500:])
+        return False
+    return os.access(WINE, os.X_OK) and BASE_TEMPLATE.exists()
+
+
+def manifest_paths():
+    paths = []
+    for root, _dirs, files in os.walk(ENGINE):
+        for f in files:
+            p = Path(root) / f
+            if not p.is_symlink():
+                paths.append(p)
+    if BASE_TEMPLATE.exists():
+        paths.append(BASE_TEMPLATE)
+    for winetricks_f in (TOOLS / "winetricks", CABEXTRACT):
+        if winetricks_f.exists() and not winetricks_f.is_symlink():
+            paths.append(winetricks_f)
+    return sorted(set(paths))
+
+
+def manifest_build():
+    """sha256 vseh datotek motorja → data/engine-manifest.json."""
+    step("Pišem manifest motorja (sha256) ...")
+    data = {}
+    for p in manifest_paths():
+        try:
+            data[str(p.relative_to(FORGE))] = [p.stat().st_size, _sha256(p)]
+        except OSError:
+            continue
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    MANIFEST.write_text(json.dumps({
+        "version": VERSION,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "files": data,
+    }))
+    log(f"  zapisanih datotek: {len(data)}")
+    return 0
+
+
+def manifest_verify():
+    """Preveri, ali je bil motor poškodovan (napak prenos, USB, sistemski pomik)."""
+    if not MANIFEST.exists():
+        warn("manifesta ni — najprej: wineforge setup --manifest")
+        return 1
+    step("Preverjam integriteto motorja")
+    files = json.loads(MANIFEST.read_text()).get("files", {})
+    bad, missing = [], []
+    for rel, (size, digest) in files.items():
+        p = FORGE / rel
+        if not p.exists():
+            missing.append(rel)
+        elif p.stat().st_size != size or _sha256(p) != digest:
+            bad.append(rel)
+    ok = not bad and not missing
+    for rel in missing[:10]:
+        err(f"manjka: {rel}")
+    for rel in bad[:10]:
+        err(f"spremenjena/pokvarjena: {rel}")
+    if missing or bad:
+        warn(f"skupaj težav: {len(missing)} manjka, {len(bad)} spremenjenih")
+        log("  Popravi z: wineforge setup   (prenese samo poškodovane dele)")
+        return 1
+    log(f"  OK — {len(files)} datotek, manifest ustreza")
+    return 0
+
+
 def ensure_ready():
     """Če manjka kaj od potrebnega, pripravi samodejno (prvi zagon na novem PC)."""
     missing = setup_missing()
     if not missing:
         return True
     warn(f"Motor nepripravljen (manjka: {', '.join(missing)}) — pripravljam ...")
-    cmd_setup(argparse.Namespace(check=False, no_bake=False, with_dotnet=False,
-                                 desktop=False))
+    cmd_setup(_ns_setup())
     return not setup_missing()
+
+
+def _ns_setup(**kw):
+    d = dict(check=False, no_bake=False, with_dotnet=False, desktop=False,
+             offline=False, parts=False, verify=False, manifest=False)
+    d.update(kw)
+    return argparse.Namespace(**d)
+
+
+def _manifest_quickfix():
+    """Hitra sanacija po manifestu: poškodovano/izginilo odstrani, da ga setup prinese nazaj."""
+    if not MANIFEST.exists():
+        return False
+    try:
+        files = json.loads(MANIFEST.read_text()).get("files", {})
+    except (OSError, ValueError):
+        return False
+    fixed = False
+
+    def broken(rel):
+        if rel not in files:
+            return False
+        size, digest = files[rel]
+        p = FORGE / rel
+        if not p.exists():
+            return True
+        try:
+            return p.stat().st_size != size or _sha256(p) != digest
+        except OSError:
+            return True
+
+    for rel in ("engine/tools/winetricks", "engine/tools/bin/cabextract",
+                "share/templates/base-prefix.tar.zst"):
+        if broken(rel):
+            warn(f"poškodovano/izginilo: {rel} — obnavljam iz cache/ponovnega prenosa")
+            (FORGE / rel).unlink(missing_ok=True)
+            fixed = True
+    if broken("engine/wine/bin/wine") and WINE.exists():
+        warn("Wine binarija je poškodovana — ponovno razpakiram (engine/wine)")
+        shutil.rmtree(WINE, ignore_errors=True)
+        fixed = True
+    if broken("engine/nvidia-libs/x64/nvcuda.dll") and NVLIBS.exists():
+        warn("nvidia-libs so poškodovane — obnavljam")
+        shutil.rmtree(NVLIBS, ignore_errors=True)
+        fixed = True
+    return fixed
 
 
 def cmd_setup(args):
     """Samodejna priprava motorja: prenese manjkajoče dele + predlogo."""
+    if getattr(args, "verify", False):
+        return manifest_verify()
+    if getattr(args, "manifest", False):
+        return manifest_build()
     if args.check:
         st = setup_status()
         for k, v in st.items():
             log(f" {'✓' if v else '✗'} {k}")
         return 0 if all(st.values()) else 1
-    step("WineForge setup — priprava motorja")
+    offline = bool(getattr(args, "offline", False))
+    step(f"WineForge setup — priprava motorja{' (offline)' if offline else ''}")
     for d in (PREFIXES, APPS, DATA, LOGS, TEMPLATES, DEPS,
               SHARE / "verbs", TOOLS, TOOLSBIN, NVLIBS):
         d.mkdir(parents=True, exist_ok=True)
-    _setup_wine()
-    _setup_nvidialibs()
-    _setup_winetricks()
-    _setup_cabextract()
+    _manifest_quickfix()
+    # 1) želimo EN prenos (engine + predloga) — samo kadar manjka kaj velikega
+    if not getattr(args, "parts", False):
+        _setup_bundle(offline=offline)
+    # 2) ostalo posamično (iz cache-a share/deps, če je že kdaj preneseno)
+    try:
+        _setup_wine(offline)
+        _setup_nvidialibs(offline)
+        _setup_winetricks(offline)
+        _setup_cabextract(offline)
+    except RuntimeError as e:
+        die(str(e))
     if not BASE_TEMPLATE.exists():
         if args.no_bake:
             warn("predloga prefixa ni zgrada (preskočeno z --no-bake)")
+        elif offline:
+            die("predloga manjka, brez povezave je ne morem zgraditi\n"
+                f"  (ali prenesi paket {ENGINE_BUNDLE})")
         else:
             step("Gradim predlogo prefixa — prvi zagon (10–20 min, prenosi VC++/.NET/WebView2)")
             cmd_bake(argparse.Namespace(name=None, resume=True, keep_going=True,
-                                        no_pack=False, with_dotnet=args.with_dotnet))
+                                        no_pack=False, with_dotnet=args.with_dotnet,
+                                        compact=False))
     # preverjanje
     st = setup_status()
     log()
@@ -1625,11 +1854,104 @@ def cmd_setup(args):
     if left:
         warn("manjka še: " + ", ".join(left))
         return 1
+    if not MANIFEST.exists():
+        manifest_build()
     step("Motor pripravljen.")
-    log("  Zagon brez terminala:  ./bin/wineforge desktop   (ustvari ikono)")
+    log("  Ikona (klik):          ./bin/wineforge desktop")
+    log("  Ikona v pladnju:       ./bin/wineforge tray")
     log("  GUI v terminalu:       ./bin/wineforge gui")
+    log("  Preveri integriteto:   ./bin/wineforge setup --verify")
     if args.desktop:
         cmd_desktop(argparse.Namespace(name=None, menu_only=False))
+    return 0
+
+
+# ---------------------------------------------------- pladnjska ikona/posodoba --
+
+def cmd_tray(args):
+    """Ikona v sistemskem pladnju (yad): programi z enim klikom."""
+    pidfile = DATA / "tray.pid"
+    if getattr(args, "quit", False):
+        try:
+            os.kill(int(pidfile.read_text().strip()), signal.SIGTERM)
+            log("Pladnjska ikona zaprta.")
+        except (OSError, ValueError):
+            pass
+        pidfile.unlink(missing_ok=True)
+        return 0
+    missing = setup_missing()
+    if missing:
+        warn(f"Motor nepripravljen (manjka: {', '.join(missing)}) — "
+             "najprej zaženi: wineforge setup")
+        return 1
+    if _dialog() is None:
+        die("Za pladnj potreben yad/zenity (npr. sudo pacman -S yad)\n"
+            "  brez njiju deluje: wineforge gui")
+    rows = [f"Odpri WineForge (gui)|'{FORGE}/bin/wineforge' gui"]
+    for a in app_list():
+        nm = a.get("name") or "?"
+        rows.append(f"Zaženi: {nm}|'{FORGE}/bin/wineforge' run '{nm}'")
+    rows += ["────────|/bin/true",
+             f"Diagnoza (doctor)|'{FORGE}/bin/wineforge' doctor",
+             f"Zapri ikono (izhod)|'{FORGE}/bin/wineforge' tray --quit"]
+    DATA.mkdir(parents=True, exist_ok=True)
+    # zapusti morebitno staro ikono (orfan iz prejšnjega zagona)
+    if pidfile.exists():
+        try:
+            os.kill(int(pidfile.read_text().strip()), signal.SIGTERM)
+            log("Zapiram prejšnjo ikono v pladnju.")
+        except (OSError, ValueError):
+            pass
+        pidfile.unlink(missing_ok=True)
+    icon = install_icon()
+    step("Vklapljam ikono v pladnju (zapreš jo z desnim klikom → Izhod)")
+    p = subprocess.Popen([shutil.which("yad") or "yad", "--notification",
+                          f"--image={icon}",
+                          "--tooltip=WineForge — programi z enim klikom",
+                          f"--menu={'\n'.join(rows)}",
+                          f"--command='{FORGE}/bin/wineforge' gui"],
+                         stdout=subprocess.DEVNULL,
+                         # pladnjski način v Wayland KDE (XWayland) zahteva X11 način
+                         env={**os.environ, "GDK_BACKEND": "x11"})
+    pidfile.write_text(str(p.pid))
+
+    def _sig_then_quit(_sig, _frm):
+        try:
+            p.terminate()
+            p.wait(timeout=2)
+        except Exception:
+            p.kill()
+        pidfile.unlink(missing_ok=True)
+        raise SystemExit(143)
+
+    signal.signal(signal.SIGTERM, _sig_then_quit)
+    signal.signal(signal.SIGINT, _sig_then_quit)
+    try:
+        p.wait()
+    finally:
+        pidfile.unlink(missing_ok=True)
+    return 0
+
+
+def cmd_update(args):
+    """Posodobi kodo (git pull) in motor po potrebi."""
+    step(f"WineForge update ({VERSION})")
+    if (FORGE / ".git").is_dir() and not getattr(args, "no_pull", False):
+        code, out = run(["git", "-C", str(FORGE), "pull", "--ff-only"], capture=True)
+        if out.strip():
+            log(out.strip()[-1000:])
+        if code:
+            warn("git pull ni uspel (lokalne spremembe?) — nadaljujem s tem, kar imam")
+    if setup_missing():
+        ensure_ready()
+    log()
+    log(f"  različica    {VERSION}  |  Wine {WINE_VER}")
+    log(f"  predloga     {human(BASE_TEMPLATE.stat().st_size) if BASE_TEMPLATE.exists() else 'ni'}")
+    log(f"  motor        {human(du(ENGINE)) if ENGINE.exists() else 'ni'}")
+    log(f"  programi     {len(app_list())}  |  prefixi {len(list_prefixes())}")
+    log(f"  manifest     {'da' if MANIFEST.exists() else 'NE (nastavi: wineforge setup --manifest)'}")
+    log()
+    step("Posodobljeno.")
     return 0
 
 
@@ -1731,20 +2053,79 @@ def cmd_desktop(args):
 # ------------------------------------------------------------------- GUI ----
 
 def _dialog():
-    """zenity ali (privzeto na KDE) yad — yad je zenity-združljiv."""
+    """zenity, yad (privzeto na KDE) ali kdialog."""
     if _DIALOG[0]:
         return _DIALOG[0]
-    for cand in ("zenity", "yad"):
+    for cand in ("zenity", "yad", "kdialog"):
         if shutil.which(cand):
             _DIALOG[0] = cand
             return cand
-    die("Za grafični vmesnik potreben zenity ALI yad (npr. sudo pacman -S yad)")
+    return None
+
+
+def _zt_kdialog(argv, input=None):
+    """Prevod zenity -> kdialog (kdialog ima popolnoma drugačno sintakso)."""
+    def opt(name):
+        return next((a.split("=", 1)[1] for a in argv if a.startswith(name + "=")), "")
+
+    title = opt("--title") or "WineForge"
+    text = opt("--text") or title
+    if "--question" in argv:
+        code, _out = run(["kdialog", "--title", title, "--yesno", text], capture=True)
+        return (0 if code == 0 else 1, "")
+    if "--info" in argv:
+        run(["kdialog", "--title", title, "--msgbox", text], capture=True)
+        return 0, ""
+    if "--entry" in argv:
+        init = next((a.split("=", 1)[1] for a in argv if a.startswith("--entry-text=")), "")
+        _c, out = run(["kdialog", "--title", title, "--inputbox", text, init],
+                      capture=True)
+        return 0, out.strip()
+    if "--password" in argv:
+        _c, out = run(["kdialog", "--title", title, "--password", text], capture=True)
+        return 0, out.strip()
+    if "--file-selection" in argv:
+        pats = [a.split("|", 1)[1].strip() for a in argv
+                if a.startswith("--file-filter=") and "|" in a]
+        cmd = ["kdialog", "--title", title, "--getopenfilename"]
+        if pats:
+            cmd.append(" ".join(pats))
+        code, out = run(cmd, capture=True)
+        return (code, out.strip())
+    if "--list" in argv:
+        ncols = sum(1 for a in argv if a.startswith("--column=")) or 1
+        cells = [c for c in opt("--list").split("||") if c.strip()]
+        if not cells:
+            pos = [a for a in argv[1:] if not a.startswith("-")]
+            cells = ["|".join(pos[i:i + ncols]) for i in range(0, len(pos), ncols)]
+        if not cells:
+            return 1, ""
+        cmd = ["kdialog", "--title", title, "--menu", text]
+        labels = []
+        for i, c in enumerate(cells):
+            label = c.split("|")[0]
+            labels.append(label)
+            cmd += [str(i), label]
+        code, out = run(cmd, capture=True)
+        if code:
+            return 1, ""
+        return 0, (out.strip() if not out.strip().isdigit()
+                   else cells[int(out.strip())].split("|")[0])
+    if input:
+        run(["kdialog", "--title", title, "--msgbox", input], capture=True)
+        return 0, ""
+    run(["kdialog", "--title", title, "--msgbox", text], capture=True)
+    return 0, ""
 
 
 def zt(*args, input=None):
-    """Zažene zenity/yad in vrne (koda, stdout)."""
+    """Zažene zenity/yad/kdialog in vrne (koda, stdout)."""
     tool = _dialog()
+    if tool is None:
+        die("Za grafični vmesnik potreben zenity ALI yad (npr. sudo pacman -S yad)")
     argv = list(args)
+    if tool == "kdialog":
+        return _zt_kdialog(argv, input=input)
     if tool == "yad":
         # zenity -> yad prevod (yad 15 nima --info/--question/--hide-header/...)
         kind = next((a for a in argv if a in ("--info", "--question")), None)
@@ -1783,9 +2164,11 @@ def _wf(*args, progress_msg=None):
     """Požene wineforge kot podproces; med delom kaže napredek."""
     cmd = [sys.executable, str(FORGE / "bin" / "wineforge"), *args]
     prog = None
-    if progress_msg and shutil.which("zenity"):
-        prog = subprocess.Popen(["zenity", "--progress", "--pulsate", "--auto-close",
-                                 "--width=420", "--title=WineForge", "--text=" + progress_msg],
+    dlg = _dialog() if progress_msg else None
+    if progress_msg and dlg in ("zenity", "yad"):
+        prog = subprocess.Popen([dlg, "--progress", "--pulsate", "--auto-close",
+                                 "--width=420", "--title=WineForge",
+                                 "--text=" + progress_msg],
                                 stdin=subprocess.PIPE)
     p = subprocess.run(cmd, capture_output=True, text=True,
                        env={**os.environ, "WINEFORGE_DIR": str(FORGE)})
@@ -1987,6 +2370,9 @@ def cmd_add(args):
     app_save(meta)
     auto_scale(name, meta)
     log(f"Dodano: {name}  (zaženi: wineforge run {name})")
+    if not getattr(args, "no_shortcut", False):
+        for p in _desktop_write(name, places=("menu", "desktop")):
+            log(f"Ikona (klik): {p}")
     return 0
 
 
@@ -2176,9 +2562,14 @@ def build_parser():
     s.add_argument("--keep-going", action="store_true", help="ne ustavi ob napaki")
     s.add_argument("--no-pack", action="store_true", help="ne pakiraj predloge")
     s.add_argument("--with-dotnet", action="store_true", help="vkljuci .NET 4.8 in .NET 8")
+    s.add_argument("--compact", action="store_true",
+                   help="odstrani pomoč/Installer cache (varja ~150 MB)")
     s.set_defaults(func=cmd_bake)
 
     s = sub.add_parser("doctor", help="preveri delovanje motorja, GPU, CUDA")
+    s.add_argument("--fix", action="store_true",
+                   help="popravi, kar se da (motor, wineserver, temp, override-i)")
+    s.add_argument("--keep-prefix", action="store_true", help="ne izbriši _doctor prefixa")
     s.set_defaults(func=cmd_doctor)
 
     s = sub.add_parser("info", help="osnovne informacije")
@@ -2194,6 +2585,8 @@ def build_parser():
     s.add_argument("--include", action="append", metavar="POT[:WINMAPA]",
                    help="celotna mapa programa, npr. /pot/do/App:Apps/App")
     s.add_argument("--args", nargs=argparse.REMAINDER)
+    s.add_argument("--no-shortcut", action="store_true",
+                   help="ne ustvari ikone na namizju/meniju")
     s.set_defaults(func=cmd_add)
 
     s = sub.add_parser("run", help="zaženi aplikacijo")
@@ -2219,6 +2612,16 @@ def build_parser():
     s = sub.add_parser("setup", help="samodejna priprava motorja (prenos manjkajočega)")
     s.add_argument("--check", action="store_true",
                    help="samo preveri, nič ne prenasa")
+    s.add_argument("--offline", action="store_true",
+                   help="ne prenašaj — uporabi samo cache (share/deps)")
+    s.add_argument("--parts", action="store_true",
+                   help="posekaj posamično (brez velikega paketa engine+predloga)")
+    s.add_argument("--no-bundle", dest="parts", action="store_true",
+                   help="isti vzdevek kot --parts")
+    s.add_argument("--verify", action="store_true",
+                   help="preveri sha256 motorja proti manifestu")
+    s.add_argument("--manifest", action="store_true",
+                   help="(znova) zapiši sha256 manifest motorja")
     s.add_argument("--no-bake", action="store_true", help="ne gradi predloge prefixa")
     s.add_argument("--with-dotnet", action="store_true", help="v predlogo dodaj .NET 4.8 + .NET 8")
     s.add_argument("--desktop", action="store_true", help="po pripravi ustvari ikono")
@@ -2228,6 +2631,14 @@ def build_parser():
     s.add_argument("name", nargs="?", help="ime aplikacije (brez: WineForge GUI)")
     s.add_argument("--menu-only", action="store_true", help="samo meni, ne na namizje")
     s.set_defaults(func=cmd_desktop)
+
+    s = sub.add_parser("tray", help="ikona v sistemskem pladnju (yad) — programi z enim klikom")
+    s.add_argument("--quit", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(func=cmd_tray)
+
+    s = sub.add_parser("update", help="posodobi kodo (git pull) in motor")
+    s.add_argument("--no-pull", action="store_true", help="samo motor, brez git pull")
+    s.set_defaults(func=cmd_update)
 
     s = sub.add_parser("shortcut", help="ustvari bližnjico v meniju")
     s.add_argument("name")
@@ -2255,6 +2666,8 @@ def build_parser():
     s.add_argument("--args", nargs=argparse.REMAINDER)
     s.add_argument("--keep-staging", action="store_true",
                    help="obdrži začasni prefix (za diagnozo)")
+    s.add_argument("--no-shortcut", action="store_true",
+                   help="ne ustvari ikone na namizju/meniju")
     s.set_defaults(func=cmd_install)
 
     s = sub.add_parser("pack", help="naredi samostojen prenosni paket")
@@ -2262,6 +2675,8 @@ def build_parser():
     s.add_argument("--out", default=str(FORGE / "dist"))
     s.add_argument("--compress", action="store_true")
     s.add_argument("--no-prefix", action="store_true")
+    s.add_argument("--desktop", action="store_true",
+                   help="takoj ustvari ikono, ki kaže na lokacijo paketa")
     s.add_argument("--force", action="store_true")
     s.set_defaults(func=cmd_pack)
 
@@ -2286,9 +2701,10 @@ def main(argv=None):
     if not getattr(args, "func", None):
         ap.print_help()
         return 0
-    # prvi zagon na novem računalniku: motor se pripravi sam (brep preverjanja
-    # gor za gui/setup/doctor — ti to zmorejo sami):
-    if args.cmd not in ("doctor", "setup", "gui", "config") and setup_missing():
+    # prvi zagon na novem računalniku: motor se pripravi sam (razen pri
+    # gui/setup/doctor/tray/update — ti to zmorejo sami oz. so namerni):
+    if args.cmd not in ("doctor", "setup", "gui", "config", "tray", "update") \
+            and setup_missing():
         ensure_ready()
     return args.func(args) or 0
 
