@@ -1,6 +1,7 @@
 # ---- velike binarne mape (motor se pripravi z scripts/setup-engine.sh) ----
 engine/
-share/
+share/*
+!share/icons/
 prefixes/
 apps/
 data/

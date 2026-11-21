@@ -18,7 +18,18 @@ WineForge/
 ## Hitri začetek
 
 ```bash
-./bin/wineforge gui                    # grafični vmesnik (kot WineCharm)
+./bin/wineforge gui                    # grafični vmesnik (zenity ALI yad, brez terminala)
+./bin/wineforge desktop                # ikona v meniju in na namizju — potem samo klik
+```
+
+**Prvi zgon na novem računalniku je samodejen** — `setup` (teče sam, ko
+kličeš katerikoli ukaz ali GUI) prenese manjkajoče: Wine, nvidia-libs,
+winetricks, prenosni `cabextract` (v `engine/tools/bin`, ne rabi roota) in
+zgradi predlogo prefixa. Preveri lahko ročno:
+
+```bash
+./bin/wineforge setup --check          # samo preveri, nič ne prenaša
+./bin/wineforge setup --with-dotnet    # ročna priprava + .NET 4.8 in .NET 8
 ```
 
 ali iz terminala:
@@ -29,14 +40,20 @@ ali iz terminala:
 ./bin/wineforge run mojapp             # zagon
 
 ./bin/wineforge install setup.exe      # namestitveni program -> prenosna aplikacija
-./bin/wineforge pack mojapp --out dist # samostojen prenosni paket (run.sh)
+./bin/wineforge pack mojapp --out dist # samostojen prenosni paket (run.sh + register.sh)
 ```
+
+Klik na ikono (`wineforge desktop`) odpre GUI — če je bil računalnik
+prestavljen/prazen, se motor najprej sam pripravi (prenosi), potem se
+odpre okno. Nič ročnega pisanja v terminal.
 
 ## Ukazi
 
 | Ukaz | Kaj naredi |
 |---|---|
-| `gui` | grafični vmesnik: dodaj / namesti / zaženi / popravi / pakiraj |
+| `gui` | grafični vmesnik (zenity/yad): dodaj / namesti / zaženi / popravi / pakiraj |
+| `desktop [app]` | ikona v meniju + na namizju (klik za zagon; brez appa = GUI) |
+| `setup` | samodejna priprava motorja: prenosi manjkajoče, gradi predlogo |
 | `shortcut` | ustvari bližnjico v meniju aplikacij |
 | `doctor` | preveri Wine, `wineboot`, GPU (`nvidia-smi`), Vulkan in CUDA v prefixu |
 | `info` | velikosti, različice, poti |
@@ -50,7 +67,7 @@ ali iz terminala:
 | `deps` | iz PE uvozov ugotovi, katere komponente program potrebuje |
 | `bake` | zgradi/posodobi predlogo prefixa (vse komponente, tudi offline) |
 | `prefix` | `list`, `new`, `delete`, `shell`, `explorer`, `tweaks` |
-| `pack` | sestavi prenosni paket z `run.sh` |
+| `pack` | sestavi prenosni paket z `run.sh` in `register.sh` (ikona) |
 | `remove` | odstrani aplikacijo (in po želji njen prefix) |
 
 ## Kaj dobiš privzeto
@@ -75,6 +92,19 @@ Vse poti so relativne na koren motorja; symlinki znotraj prefixov kažejo na
 `engine/` prek `../../..`. Paket iz `pack` vsebuje motor + aplikacijo + prefix +
 `run.sh` in deluje iz katerekoli mape ali USB ključa.
 
+**Premik na drug računalnik:** kopiraj/drugo mapo motorja (ali paket) in poženi
+karkoli — `setup` sam ugotovi, kaj manjka, in to prenese/Zgradi:
+
+| Manjka | Naredi sam |
+|---|---|
+| `engine/wine` | prenese Wine 11.22 (sha256 preverjen) in razpakira |
+| `engine/nvidia-libs` | prenese SveSop nvidia-libs 1.0.5 |
+| `engine/tools/winetricks` | prenese winetricks |
+| `cabextract` | prenese prenosno kopijo v `engine/tools/bin` (brez roota) |
+| `share/templates/base-prefix.tar.zst` | `bake` predlogo (DXVK, VC++/.NET, WebView2 ...) |
+
+Od sistemskega programa potrebuješ samo: **64-bitni Python 3, curl, tar,
+zstd, zenity ali yad** (GUI; na KDE je navadno že `yad`).
 Zahteve: 64-bit Linux, glibc ≥ 2.31, Vulkan gonilnik. Za CUDA: NVIDIA gonilnik 580+.
 
 ## Znane pasti
