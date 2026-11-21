@@ -129,6 +129,21 @@ Zahteve: 64-bit Linux, glibc ≥ 2.31, Vulkan gonilnik. Za CUDA: NVIDIA gonilnik
 
 ## Znane pasti
 
+* **WebView2 programi se v Wineu ne izrišejo** (Epic Games Launcher 2.x,
+  Microsoft Teams/Outlook, marsikateri nov "Electron/WebView2" program):
+  program se zažene (v dnevniku piše `Startup.Completed`), uporabnik pa vidi
+  **črno okno z belim kvadratom** ali prazno belo okno. Vzrok ni WineForge,
+  ampak Wine: Chromium pošilja sliko v okno po poti D3D11 shared-texture +
+  DirectComposition, ki je Wine še ne podpira
+  ([Wine bug 59370](https://bugs.winehq.org/show_bug.cgi?id=59370)).
+  Preizkušeno in **ne pomaga**: `--disable-gpu`, `--disable-direct-composition`,
+  `--in-process-gpu`, `--no-sandbox`, `--use-angle=swiftshader`, brez DXVK,
+  svež profil WebView2, onemogočen `nvapi`/`nvml`, druga resolucija/DPI.
+  Rešitev: uporabi Linux različico programa, če obstaja — za Epic Games
+  Launcher uradni Linux AppImage/deb (<https://launcher.epicgames.com/>,
+  od verzije 0.120 deluje tudi prijava in knjižnica) ali Heroic Games Launcher.
+  WineForge tak program zdaj prepozna in ob `add`/`install` opozori.
+
 * **Storitve, PowerShell in gonilniki:** Wine nima pravega Windows upravitelja
   storitev in njegov `powershell.exe` je samo "stub". Namestitveni programi,
   ki med namestitvijo kličejo PowerShell skripte ali speljejo lastne storitve
@@ -140,7 +155,7 @@ Zahteve: 64-bit Linux, glibc ≥ 2.31, Vulkan gonilnik. Za CUDA: NVIDIA gonilnik
   le registrira vsak zagon bo znova zagnal namestitev. Za installer-je uporabi
   `install` (v GUI-ju: "Namesti program").
 
-* **Ne ubijaj aplikacije s `kill -9`** — WebView2/Chromium aplikacije ob tem
+* **Ne ubijaj aplikacije s `kill -9`** — Chromium/Electron aplikacije ob tem
   izgubijo/pokvarijo podatke in okno ostane belo. Zapri z X ali Ctrl+Q;
   za popravilo: `wineforge repair <app>`.
 * Belo okno brez vrstice `Presenter:` v DXVK logu = Chromium ni ustvaril
