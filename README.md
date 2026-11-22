@@ -79,7 +79,7 @@ odpre okno. Nič ročnega pisanja v terminal.
 | `install` | zažene installer in iz njega naredi prenosno aplikacijo (`--no-shortcut`) |
 | `disc` | igre s CD/DVD ali ISO: `--iso`, `--install`, `--link`, `--eject` |
 | `media` | preveri/dopolni predvajanje videa v igrah (`--fix`, brez roota) |
-| `sim` | programu da skrbniške pravice in njegovo windows storitev (simulacija) |
+| `sim` | skrbniške pravice + windows storitev + identiteta (`--verify`, `--win`, `--pin`) |
 | `deps` | iz PE uvozov ugotovi, katere komponente program potrebuje |
 | `bake` | zgradi/posodobi predlogo prefixa; `--compact` varčuje ~150 MB |
 | `prefix` | `list`, `new`, `delete`, `shell`, `explorer`, `tweaks` |
@@ -228,57 +228,97 @@ WineForge to uredi `wineforge media --fix`, plugini pa potujejo z motorjem.
 
 ## Program, ki hoče skrbnika ali windows storitev
 
-Nekateri programi (StarDesk, overlay orodja, nekateri VPN-i, starejši
-glasbeni vmesniki) zaženejo še **windows storitev** in hočejo **skrbniške
-pravice**. Brez tega se pritožijo (`failed to open service 1060`) ali pa se
-sploh ne zaženejo.
+Nekateri programi (StarDesk, overlay orodja, nekateri VPN-i, programske
+tipkovnice) zaženejo še **windows storitev** in hočejo **skrbniške pravice**.
+Brez tega se pritožijo (`failed to open service 1060`) ali pa se sploh ne
+zaženejo.
 
-Wine na srečo **ima pravi SCM** (bazen windows storitev): `sc create` dela,
-njegov `services.exe` pa registrirane storitve zna tudi zagnati. Zato jih ni
-potrebno ponarediti v registru — samo registrirati jih je treba, ker installer
-teh korakov pod Wineom ne more opraviti do konca.
+Wine ima **pravi SCM** (upravitelj windows storitev): `sc create` dela, njegovi
+`services.exe` pa registrirane storitve tudi sam zažene. Zato storitve ni
+potrebno ponarejati — installer je samo ne more registrirati, ker teh korakov
+pod Wineom ne more opraviti do konca.
 
 ```bash
-wineforge sim <ime>              # samodejno: najde storitve, jih registrira in zažene
-wineforge sim <ime> --status     # kaj je registrirano in kaj teče
+wineforge sim <ime>              # samodejno: najde storitve, registrira, zažene + nastavi pravice
+wineforge sim <ime> --verify     # v prefixu poženi sondo: kaj PROGRAM vidi
+wineforge sim <ime> --status     # kaj je registrirano in kateri pid teče
+wineforge sim <ime> --win 11     # maska Windows 11 23H2 (ver = 10.0.22631)
+wineforge sim <ime> --pin        # utrdi identiteto stroja (MachineGuid, HwProfileGuid, …)
 wineforge sim <ime> --stop       # ustavi simulirane storitve
 wineforge sim <ime> --no-admin   # razveljavi lažno povišanje
 
-# ročno, če samodejno iskanje ne zadene:
-wineforge sim <ime> --svc "MojaStoritev=C:\Program Files\Program\Storitev.exe"
-# z argumenti (loči z |):
-wineforge sim <ime> --svc "MojaStoritev=C:\...\Storitev.exe|--silent"
+# ročno, če samodejno iskanje ne zadene (argumente loči z |):
+wineforge sim <ime> --svc "MojaStoritev=C:\Program Files\Program\Storitev.exe|--silent"
 ```
 
-Samodejno registrira samo tiste binarke, ki se po imenu vedejo kot storitev
-(`*service*`, `*daemon*`); ostale samo našteje in predlaga ukaz zanje — tako
-se ne more zgoditi, da bi po nesreči zagnal `PsExec` ali kaj podobnega.
+Samodejno registrira samo binarke, ki se po imenu vedejo kot storitev
+(`*service*`, `*daemon*`); ostale samo našteje in predlaga ukaz zanje, da po
+nesreči ne zažene `PsExec` ali kaj podobnega.
 
-Ukaz naredi tri stvari:
+### Kaj `sim` uredi
 
-1. **Pravice** — v registru nastavi skrbniške politike (`EnableLUA=0,
-   ConsentPromptBehaviorAdmin=0, ...`), da program ne čaka na potrditev UAC.
-   Wine ionako nima UAC in je tvoj windows uporabnik skrbnik, zato to
-   pogosto ni potrebno — a nekateri programi te vrednosti berejo.
-2. **Storitev** — napiše jo v `HKLM\System\CurrentControlSet\Services`
-   (isto kot `sc create`) in jo zažene; če se sama ne zna javiti SCM-ju, jo
-   WineForge drži kot navaden proces. Ko je enkrat vpisana, jo `wineforge run
-   <ime>` zažene sam pred vsakim zagonem programa.
-3. **Pogled** — pove, kaj je registrirano in kateri pid teče
-   (`wineforge sim <ime> --status`).
+1. **Pravice** — v registru nastavi skrbniške politike (`EnableLUA=0`,
+   `ConsentPromptBehaviorAdmin=0`, …), da program ne čaka na potrditev UAC.
+2. **Storitev** — napiše jo v `HKLM\System\CurrentControlSet\Services` (isto
+   kot `sc create`) in jo zažene; če se sama ne zna javiti SCM-ju, jo WineForge
+   drži kot navaden proces. Ko je enkrat vpisana, jo `wineforge run <ime>`
+   zažene sam pred vsakim zagonem programa.
+3. **Identiteta** — `--pin` dopolni manjkajoče identifikatorje (`MachineGuid`,
+   `HwProfileGuid`, `InstallDate`), da se "stroj" ne spreminja in programska
+   oprema, ki veže licenco na stroj, ne sklene rogate.
+4. **Raziskava** — `--verify` prevede in požene sondo v samem prefixu ter
+   natisne, kaj program vidi; `--status` našteje jedrske gonilnike v
+   namestitvi in ich linuxne ustreznike.
 
-### Česa ta simulacija NE more
+### Kaj je izmerjeno (sonda v prefixu, Wine 11.22)
 
-* **jedrskih gonilnikov** — anti-cheat (EAC, BattlEye, Vanguard), nekatere
-  zaščite pred kopiranjem in nekateri VPN-i gredo v jedro Windows; tega Wine
-  ne more ponarediti,
-* **jedrskih omrežnih filtrov** (= pravi požarni zid / preusmerjanje prometa),
-* **posebnih pravic, kot je `SeDebugPrivilege`** — brskanje po tujih procesih
-  (orodja za varnostne preiskave, cheat enginei).
+| kaj program vidi | rezultat |
+|---|---|
+| `IsInRole(Administrator)` | **True** — Wine-ov uporabnik je skrbnik |
+| pravice v žetonu | **21**, med njimi `SeDebug`, `SeShutdown`, `SeLoadDriver`, `SeTcb`, `SeImpersonate` |
+| `AdjustTokenPrivileges(SeDebugPrivilege)` | **USPELO** (enako za zgornje vse) |
+| storitev, registrirana z `sim` | **Running** — tako v `sc query` kot v **WMI** (`Win32_Service`) in v .NET `ServiceController` |
+| `Win32_ComputerSystemProduct` (WMI) | deluje, vrne UUID → strojne preverbe grejo skozi |
+| `ver` / `CurrentBuild` | `10.0.22631` po `--win 11` |
+| `whoami /priv`, `whoami /groups` | nista implementirana (program, ki ju bere, ne dobi ničesar) |
 
-Skratka: **uporabniški del** (storitev + skrbnik) je izenačen, **jedrski del**
-ne more biti. Ker je razlog za vsak program drugačen, `doctor` in izpis
-`sim --status` pokažeta, do kod je prišlo.
+Od tod sledi pomembno popravilo splošnega verovanja: **pravice pod Wine niso
+ovira** — žeton je bogatejši kot na navadnem Windowsu. Ovire so drugje.
+
+### Česa ta simulacija NE more (in zakaj)
+
+* **jedrskih gonilnikov** (`*.sys`). `sim --status` jih najde in razloži.
+  Pod Wineom ni načina, da bi jedro Windows obstalo; pod Linuxom ima vsak tak
+  gonilnik svoj ustreznik:
+
+  | windows gonilnik | kaj děla | ustreznik pod Linuxom |
+  |---|---|---|
+  | `ViGEmBus.sys` | navidezni Xbox/DS gamepad | `/dev/uinput` (Sunshine, AntiMicroX) |
+  | lastni `*vhid*.sys` | navidezna tipkovnica / miš / pad | `/dev/uinput` |
+  | `*Idd*.sys` (IddCx) | navidezni zaslon | `vkms`, Wayland virtual output |
+  | `USBPcap` / USB/IP stack | preusmeritev USB naprav | `usbip` (v jedru), `usbipd` |
+  | `tap/tun/wintun` | VPN vmesnik | `tun/tap` (NetworkManager) |
+  | EAC / BattlEye / Vanguard / FACEIT | jedrni anti-cheat | **ni ustreznika** — igra ne teče |
+  | SafeDisc / SecuROM / StarForce | stara zaščita pred kopiranjem | ponatis (GOG/Steam) |
+
+* **SYSTEM računa in njegovih kanalov**: `PsExec -s` pod Wineom registrira svojo
+  storitev, pade pa pri kopiranju ključa (`Neveljaven rokop`) — manjka pravi
+  SMB + SYSTEM kanal.
+* **WebView2 oken** (Epic Launcher 2.x, novi Teams, StarDesk klient in drugi
+  Chromium/DirectComposition vmesniki): v poročilu Wine bug 59370 je avtor
+  naredil **50+ eksperimentov** in med drugim preizkusil DXVK, llvmpipe,
+  SwiftShader, `--use-angle=gl/swiftshader/vulkan`, `--disable-gpu`,
+  `--disable-direct-composition` in lastne DComp pogačke — vse vreme. Razlog je
+  v zanka `ANGLE → D3D11 deljene teksture → Chromium compositor → DComp`, ki je
+  Wine nima; sam upodobljevalnik (renderer) deluje, pokvarjen je le izris.
+  Rešitve iz uporabniškega prostora ni.
+
+Skratka: **uporabniški del** (uporabnik, pravice, žeton, storitve, WMI,
+register, licenčni identifikatorji) je pod Wineom izenačen ali celo boljši;
+**jedrski del in neposredni izris (DComp) ne moreta biti**. Kjer je srž programa
+v jedru, je edina zdrava pot linuxni ustreznik — za predvajanje zaslona z
+igralno tipkovnico sta to **Sunshine + Moonlight** (uinput, vkms, zvočna zanka)
+ali **RustDesk**, za deljenje USB naprav pa `usbip`.
 
 ## Prenosnost
 

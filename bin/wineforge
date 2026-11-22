@@ -24,6 +24,7 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 VERSION = "0.1.0"
@@ -3011,6 +3012,249 @@ def sim_status(prefix, svcs):
                      + ("" if s.get("auto", True) else " [ročni zagon]"))
     return "\n".join(lines)
 
+# ------ pogled programa (kaj vidi program) + identiteta/stroj "lažnega" ------
+
+# C# sonda: prenese se in prenese v prefixu (rabí .NET Framework csc.exe, ki je
+# v predlogi). Pokaze TO, kar program vidi: ali je skrbnik, katere pravice ima
+# žeton, kako so videne storitve, kakšen stroj je napisan v registru.
+PROBE_CS = r'''
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.ServiceProcess;
+using Microsoft.Win32;
+
+class Probe {
+    [StructLayout(LayoutKind.Sequential)] struct LUID { public uint Low; public int High; }
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr h, uint access, out IntPtr tok);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool GetTokenInformation(IntPtr tok, int cls, IntPtr buf, int len, out int ret);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool LookupPrivilegeName(string host, ref LUID luid, StringBuilder name, ref int len);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AdjustTokenPrivileges(IntPtr tok, bool disableAll, IntPtr st, int n, IntPtr prev, int[] ret);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool LookupPrivilegeValue(string host, string name, out LUID luid);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+
+    static void Main(string[] argv) {
+        WindowsIdentity wi = WindowsIdentity.GetCurrent();
+        Console.WriteLine("uporabnik: " + wi.Name);
+        Console.WriteLine("skrbnik (IsInRole Administrator): " +
+                          new WindowsPrincipal(wi).IsInRole(WindowsBuiltInRole.Administrator));
+        Console.WriteLine("Windows: " + Environment.OSVersion + "  64bit=" + Environment.Is64BitProcess);
+        Console.WriteLine("Naziv: " + Reg(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "ProductName")
+                          + " " + Reg(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "DisplayVersion")
+                          + " (build " + Reg(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuild") + ")");
+        Console.WriteLine("EnableLUA: " + Reg(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "EnableLUA"));
+        Console.WriteLine("MachineGuid: " + Reg(@"SOFTWARE\Microsoft\Cryptography", "MachineGuid"));
+        Console.WriteLine("HwProfileGuid: " + Reg(@"SYSTEM\CurrentControlSet\Control\IDConfigDB\Hardware Profiles\0001", "HwProfileGuid"));
+
+        IntPtr tok;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x28, out tok)) {
+            Console.WriteLine("žeton: OpenProcessToken napaka " + Marshal.GetLastWin32Error());
+            return;
+        }
+        int ret;
+        GetTokenInformation(tok, 3, IntPtr.Zero, 0, out ret);
+        IntPtr buf = Marshal.AllocHGlobal(ret);
+        int skupil = 0, vklopljenih = 0;
+        if (GetTokenInformation(tok, 3, buf, ret, out ret)) {
+            int count = Marshal.ReadInt32(buf);
+            for (int i = 0; i < count; i++) {
+                IntPtr e = IntPtr.Add(buf, 4 + i * 12);
+                LUID luid = new LUID();
+                luid.Low = (uint)Marshal.ReadInt32(e);
+                luid.High = Marshal.ReadInt32(IntPtr.Add(e, 4));
+                uint attr = (uint)Marshal.ReadInt32(IntPtr.Add(e, 8));
+                int nlen = 256;
+                StringBuilder sb = new StringBuilder(256);
+                if (LookupPrivilegeName(null, ref luid, sb, ref nlen)) {
+                    skupil++;
+                    if ((attr & 2) != 0) vklopljenih++;
+                }
+            }
+            Console.WriteLine("pravice v žetonu: " + skupil + " (vklopljenih " + vklopljenih + ")");
+        }
+        foreach (string priv in new string[] { "SeDebugPrivilege", "SeShutdownPrivilege",
+                                               "SeLoadDriverPrivilege", "SeTcbPrivilege", "SeImpersonatePrivilege" }) {
+            LUID l;
+            if (!LookupPrivilegeValue(null, priv, out l)) {
+                Console.WriteLine("  " + priv + ": NE OBSTJA");
+                continue;
+            }
+            IntPtr st = Marshal.AllocHGlobal(16);
+            Marshal.WriteInt32(st, 1);
+            Marshal.WriteInt32(st, 4, (int)l.Low);
+            Marshal.WriteInt32(st, 8, l.High);
+            Marshal.WriteInt32(st, 12, 2);
+            int[] rl = new int[1];
+            bool ok = AdjustTokenPrivileges(tok, false, st, 0, IntPtr.Zero, rl);
+            int err = Marshal.GetLastWin32Error();
+            Console.WriteLine("  " + priv + ": " + ((ok && err == 0) ? "VKLOP USPEL" : "napaka " + err));
+            Marshal.FreeHGlobal(st);
+        }
+        if (argv.Length > 0) {
+            Console.WriteLine("storitve, kot jih vidi program:");
+            foreach (string s in argv) {
+                try {
+                    ServiceController sc = new ServiceController(s);
+                    sc.Refresh();
+                    Console.WriteLine("  " + s + ": " + sc.Status);
+                } catch (Exception e) {
+                    Console.WriteLine("  " + s + ": " + e.GetType().Name);
+                }
+            }
+        }
+    }
+
+    static string Reg(string key, string val) {
+        try {
+            object o = Registry.LocalMachine.OpenSubKey(key).GetValue(val);
+            return o == null ? "(nic)" : o.ToString();
+        } catch (Exception) { return "(ni kljuca)"; }
+    }
+}
+'''
+
+NTV = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+
+# Windows "maska": nekateri programi (in igre) zavrnejo zagon, ce ne vidijo
+# dovolj novega Windowsa. Wine poroca verzijo iz registra, zato to deluje.
+WIN_PROFILES = {
+    "10": {"ProductName": "Windows 10 Pro", "CurrentBuild": "19045", "CurrentBuildNumber": "19045",
+           "DisplayVersion": "22H2", "ReleaseID": "22H2", "UBR": "5011",
+           "Major": "10", "Minor": "0"},
+    "11": {"ProductName": "Windows 11 Pro", "CurrentBuild": "22631", "CurrentBuildNumber": "22631",
+           "DisplayVersion": "23H2", "ReleaseID": "23H2", "UBR": "4317",
+           "Major": "10", "Minor": "0"},
+}
+
+
+def win_apply(prefix, which):
+    """Napise Windows masko (verzija/izdaja) v register prefixa."""
+    prof = WIN_PROFILES.get(str(which))
+    if not prof:
+        return False
+    reg_add(prefix, NTV, "ProductName", prof["ProductName"])
+    reg_add(prefix, NTV, "CurrentBuild", prof["CurrentBuild"])
+    reg_add(prefix, NTV, "CurrentBuildNumber", prof["CurrentBuildNumber"])
+    reg_add(prefix, NTV, "DisplayVersion", prof["DisplayVersion"])
+    reg_add(prefix, NTV, "ReleaseID", prof["ReleaseID"])
+    reg_add(prefix, NTV, "CurrentMajorVersionNumber", prof["Major"], "REG_DWORD")
+    reg_add(prefix, NTV, "CurrentMinorVersionNumber", prof["Minor"], "REG_DWORD")
+    reg_add(prefix, NTV, "UBR", prof["UBR"], "REG_DWORD")
+    reg_add(prefix, NTV, "BuildLab", prof["CurrentBuild"] + ".1")
+    reg_add(prefix, NTV, "Path", r"%SystemRoot%\\Windows")
+    return True
+
+
+def identity(prefix):
+    """Trenutna identiteta 'stroj' (za fingerprint preverbe programov)."""
+    return {
+        "ComputerName": reg_get(prefix, r"HKLM\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName", "ComputerName"),
+        "MachineGuid": reg_get(prefix, r"HKLM\SOFTWARE\Microsoft\Cryptography", "MachineGuid"),
+        "HwProfileGuid": reg_get(prefix, r"HKLM\SYSTEM\CurrentControlSet\Control\IDConfigDB\Hardware Profiles\0001", "HwProfileGuid"),
+        "ProductName": reg_get(prefix, NTV, "ProductName"),
+        "Build": reg_get(prefix, NTV, "CurrentBuild"),
+        "InstallDate": reg_get(prefix, NTV, "InstallDate"),
+    }
+
+
+def identity_pin(prefix):
+    """Ustvari/manjka manjkajoce identifikatorje, da se stroj ne spreminja."""
+    made = []
+    if not identity(prefix)["MachineGuid"]:
+        reg_add(prefix, r"HKLM\SOFTWARE\Microsoft\Cryptography", "MachineGuid", str(uuid.uuid4()))
+        made.append("MachineGuid")
+    if not identity(prefix)["HwProfileGuid"]:
+        reg_add(prefix, r"HKLM\SYSTEM\CurrentControlSet\Control\IDConfigDB\Hardware Profiles\0001",
+                "HwProfileGuid", "{" + str(uuid.uuid4()).upper() + "}")
+        made.append("HwProfileGuid")
+    if not identity(prefix)["InstallDate"]:
+        reg_add(prefix, NTV, "InstallDate", str(int(time.time())), "REG_DWORD")
+        made.append("InstallDate")
+    return made
+
+
+def probe_exe(prefix):
+    """Prevede sondo v prefixu (ali vrne že prevedeno)."""
+    csc_win = None
+    for rel in (r"C:\windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+                r"C:\windows\Microsoft.NET\Framework\v4.0.30319\csc.exe"):
+        if (prefix / "drive_c" / rel[3:].replace("\\", "/")).exists():
+            csc_win = rel
+            break
+    if not csc_win:
+        return None
+    src = DEPS / "probe"
+    src.mkdir(parents=True, exist_ok=True)
+    cs = src / "probe.cs"
+    cs.write_text(PROBE_CS)
+    out = src / ("probe-" + hashlib.sha1(str(prefix).encode()).hexdigest()[:8] + ".exe")
+    if out.exists():
+        return wine_path(out)
+    code, _ = wine([csc_win, "/nologo", "/reference:System.ServiceProcess.dll",
+                    "/out:" + wine_path(out), wine_path(cs)], prefix=prefix, capture=True)
+    return wine_path(out) if code == 0 and out.exists() else None
+
+
+def probe_run(prefix, svc_names=()):
+    """Pokaze, kaj program vidi (pravice, storitve, stroj)."""
+    exe = probe_exe(prefix)
+    if not exe:
+        return None
+    code, out = wine([exe] + list(svc_names), prefix=prefix, capture=True)
+    vr = []
+    for line in (out or "").splitlines():
+        if ":" in line and not re.match(r"^[0-9a-f]{4}:", line):
+            vr.append(line.strip())
+    return "\n".join(vr)
+
+
+# ------ kaj je za Wine neemulabilno: jedrski gonilniki v namestitvi ---------
+
+# (znamenje v imenu datoteke, kaj je, kaj je ustrezen pod Linuxom)
+DRIVER_HINTS = (
+    (("vigembus",), "ViGEmBus — navidezni gamepadi (Xbox/DS)",
+     "/dev/uinput (Sunshine, AntiMicroX, python-evdev)"),
+    (("sdvhid", "vhid"), "navidezni HID (tipkovnica / mis / pad)",
+     "/dev/uinput"),
+    (("idd",), "IddCx — navidezni zaslon",
+     "vkms (Wayland/X11) ali navaden zaslon"),
+    (("usbpcap", "usbip"), "USB/IP preusmeritev USB naprav",
+     "jedrski usbip (pacman -S usbip) ali usbipd"),
+    (("easyanticheat", "eac"), "Easy Anti-Cheat (jedrni)",
+     "ni ustreznika — igra pod Linuxom ne teče"),
+    (("battleye", "bedl"), "BattlEye (jedrni)", "ni ustreznika"),
+    (("vgk", "vanguard"), "Riot Vanguard (jedrni)", "ni ustreznika"),
+    (("faceit",), "FACEIT AC (jedrni)", "ni ustreznika"),
+    (("sptd", "securom", "safedisc"), "stara zaščita pred kopiranjem",
+     "GOG/Steam ponatis ali originalni disk"),
+    (("tap", "tun", "wintun"), "navidezno omrežje (VPN)", "Linux tun/tap (netplan, NetworkManager)"),
+)
+
+
+def drivers_scan(prefix, limit=14):
+    """Najde jedrske gonilnike (.sys/.inf) v namestitvi in razlazi, kaj so."""
+    found = []
+    for f in sorted(prefix.glob("drive_c/Program Files*/**/*.sys")):
+        base = f.name.lower()
+        rel = str(f.relative_to(prefix))
+        for marks, kaj, linux in DRIVER_HINTS:
+            if any(mark in rel.lower() for mark in marks) or any(mark in base for mark in marks):
+                found.append({"file": rel, "kaj": kaj, "linux": linux})
+                break
+        else:
+            found.append({"file": rel, "kaj": "jedrski gonilnik (" + f.stem + ")",
+                          "linux": "ni znanega ustreznika"})
+        if len(found) >= limit:
+            break
+    return found
+
+
 def cmd_sim(args):
     """Programu predstavi, da je dobil skrbniške pravice in da njegova storitev teče."""
     meta = app_load(args.name)
@@ -3059,6 +3303,13 @@ def cmd_sim(args):
             log("V prefixu ni bilo najdene programske storitve "
                 "(dodaj ročno: wineforge sim " + args.name + ' --svc "IME=C:\\pot\\x.exe")')
 
+    if args.win and not win_apply(prefix, args.win):
+        warn(f"Neznan profil Windowsa '{args.win}' (poznam: " + ", ".join(WIN_PROFILES) + ")")
+    if args.pin:
+        created = identity_pin(prefix)
+        log("Identiteta stroja: " + ("dodano " + ", ".join(created) if created
+                                     else "že celovita (MachineGuid, HwProfileGuid, InstallDate)"))
+
     env = dict(meta.get("env") or {})
     if args.admin:
         admin_sim(prefix, True)
@@ -3083,7 +3334,29 @@ def cmd_sim(args):
         for s in svcs:
             svc_stop(prefix, s["name"], s["exe"])
         log("storitve ustavljene")
-    print(sim_status(prefix, svcs))
+    if args.verify or args.status:
+        ident = identity(prefix)
+        print("  stroj: " + f"{ident['ProductName']} build {ident['Build']}, "
+              f"ComputerName={ident['ComputerName']}, MachineGuid={str(ident['MachineGuid'])[:13]}…")
+    if args.verify:
+        izp = probe_run(prefix, [s["name"] for s in svcs])
+        if izp is None:
+            warn("sonde ni bilo mogoče prevesti (v prefixu ni .NET Framework csc.exe) — "
+                 "pokliči: wineforge prefix tweaks ali winetricks dotnet48")
+        else:
+            print("\nKaj program vidi (sonda v prefixu):")
+            for line in izp.splitlines():
+                print("  " + line)
+    else:
+        print(sim_status(prefix, svcs))
+    gon = drivers_scan(prefix)
+    if gon:
+        print("\nJedrski gonilniki v namestitvi (tega Wine NE more emulirati):")
+        for g in gon:
+            print(f"  {g['file']}\n      je: {g['kaj']}\n      pod Linuxom: {g['linux']}")
+        warn("Uporabniški del (pravice, storitve, register, žeton) je izenačen; ti\n"
+             "gonilniki gredo v jedro Windows in jih Wine ne more ponarediti —\n"
+             "če je v njih srž programa, je prava pot linuxni ustreznik.")
     return 0
 
 
@@ -3842,6 +4115,12 @@ def build_parser():
     s.add_argument("--no-admin", action="store_true", help="razveljavi lažno povišanje")
     s.add_argument("--stop", action="store_true", help="ustavi simulirane storitve")
     s.add_argument("--status", action="store_true", help="samo prikaži stanje")
+    s.add_argument("--verify", action="store_true",
+                   help="v prefixu poženi sondo in pokaži, kaj program vidi (pravice, storitve, stroj)")
+    s.add_argument("--win", metavar="10|11",
+                   help="napiši masko Windowsa (nekateri programi zavrnejo starejše)")
+    s.add_argument("--pin", action="store_true",
+                   help="utrdi identiteto stroja (MachineGuid, HwProfileGuid, InstallDate)")
     s.set_defaults(func=cmd_sim)
 
     return p
