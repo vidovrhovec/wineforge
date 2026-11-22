@@ -80,7 +80,7 @@ odpre okno. Nič ročnega pisanja v terminal.
 | `disc` | igre s CD/DVD ali ISO: `--iso`, `--install`, `--link`, `--eject` |
 | `media` | preveri/dopolni predvajanje videa v igrah (`--fix`, brez roota) |
 | `sim` | skrbniške pravice + windows storitev + identiteta (`--verify`, `--win`, `--pin`) |
-| `pad` | navidezni Xbox_ročko za igre (`--start`, `--press`, `--axis`, `--dpad`, `--seq`) |
+| `pad` | navidezni Xbox gamepad za igre (`--start`, `--press`, `--axis`, `--dpad`, `--seq`) |
 | `deps` | iz PE uvozov ugotovi, katere komponente program potrebuje |
 | `bake` | zgradi/posodobi predlogo prefixa; `--compact` varčuje ~150 MB |
 | `prefix` | `list`, `new`, `delete`, `shell`, `explorer`, `tweaks` |
@@ -325,7 +325,7 @@ ali **RustDesk**, za deljenje USB naprav pa `usbip`.
 
 Tisto zgoraj ni prazna obljuba: **Linux ima za windowske jedrske gonilnike
 navideznih naprav svoj ustreznik**, in Wine ga pokaže windowski igri kot pravo
-napravo. `wineforge pad` naredi raven `Xbox 360` gamepad v **Linuxovem jedru**
+napravo. `wineforge pad` naredi navidezni `Xbox 360` gamepad v **Linuxovem jedru**
 (`/dev/uinput`) — brez roota, brez windowskega kernela, brez virtualnega
 računalnika in brez izgube hitrosti (gre za navadni jedrski vhod).
 
@@ -364,6 +364,69 @@ korak; na tem sistemu ni bil potreben).
 
 ```bash
 WINEFORGE_ENGINE=$PWD/engine/alt/wine-dcomp ./bin/wineforge run igra
+```
+
+## Ali DComp zakrpe rešijo WebView2 okna? (izmerjeno 22. 11. 2026)
+
+Namesto ugibanja sem pripel zakrpan Wine in ga izmeril ob navadnega. Zakrpe so
+serija `d2d1`/`dcomp` (giang17/wine, samodejne gradnje `Mark12870/wine-d2d1-dcomp`,
+`wine-11.0-887`), razpakirane v `engine/alt/wine-dcomp` — brez roota, enako kot
+pri osnovnem motorju. Zagon: `WINEFORGE_ENGINE=$PWD/engine/alt/wine-dcomp bin/wineforge …`
+
+Sonda `scripts/probe-dcomp.cs` (prenese jo `csc.exe` v prefixu) vrne:
+
+| klic | Wine 11.22 (navadni) | zakrpan build (d2d1-dcomp) |
+|---|---|---|
+| `D3D11CreateDevice(HARDWARE)` | `0x80070057` | `0x80070057` |
+| `D3D11CreateDevice(WARP)` | `S_OK` | `S_OK` |
+| `DCompositionCreateDevice(..., IID_IUnknown)` | `E_NOTIMPL` — pogačka | **`S_OK` — pravi objekt** |
+| `DCompositionCreateDevice(..., IID_IDCompositionDevice)` | `E_NOTIMPL` | `E_NOINTERFACE` |
+| `DCompositionCreateDevice(..., IID_IDCompositionDevice2)` | `E_NOTIMPL` | `E_NOINTERFACE` |
+| `DCompositionCreateSurfaceHandle` | **zruši proces** | `S_OK` |
+
+Zakrpe torej **niso pogačka**: DComp objekt res nastane. Vendar objekt še vedno
+**ne odgovori na vmesnik, ga aplikacije prosijo** (`IDCompositionDevice` / `-Device2`
+→ `E_NOINTERFACE`), chromiumov compositor pa prav teh vmesnikov rabi.
+
+### Kje se danes zatakne WebView2 (Epic / novi Teams / StarDesk klient)
+
+WebView2 runtime 157.0.4341.60 se v prefix normalno **nainstalira** (692 MB, kar
+zgodaj ni šlo), Epicov launcher (v2, Rust + WebView2) pod Wineom tudi naredi
+okno 1280×720 — nato pa **pade sam chromiumov browser proces**, in šele to je
+danes pravi zid:
+
+```
+ERROR eglv2_lib::webview::navigation::windows: WebView2 browser process exited
+      mid-session; every webview is gone ... exit_code_hex=0x80000003
+Watson: ApplicationName=msedgewebview2.exe; ModuleName=msedge.dll;
+        ModuleOffset=191849725; ProcessType=browser; SubCode=0x80000003
+```
+
+`0x80000003` je Chromiumjev lasten `CHECK`/`IMMEDIATE_CRASH` (ukaz `int3`) — ne
+Wineova izjema. Enako se zgodi na obeh motorjih in z `--no-sandbox`,
+`--disable-gpu`, `--disable-direct-composition`, `--in-process-gpu` ter z
+izklopljenim DXVK-NVAPI Reflex slojem (`WINEFORGE_NO_REFLEX=1`). Mini dump sem
+razčlenil (`Crashpad/reports/*.dmp`) in zlom je znotraj `msedge.dll` na pomiku
+`0xb6f64fd`, proces tipa `browser`.
+
+**Zaključek:** zakrpe DComp dejansko dopolni, a WebView2 oken še ne odprejo, ker
+se veriga prelomi *prej* — v chromiumovi lastni validaciji. Pogoji za ponovitev:
+
+```bash
+# 1) zakrpan motor v prefix (ne rabi roota; ~220 MB)
+U=https://github.com/Mark12870/wine-d2d1-dcomp/releases/latest/download/
+U+=wine-d2d1-dcomp-11.0-887-p4-x86_64.tar.zst
+curl -sL "$U" -o engine/alt/dcomp.tar.zst
+mkdir -p engine/alt/wine-dcomp && tar --zstd -xf engine/alt/dcomp.tar.zst -C engine/alt/wine-dcomp
+mv engine/alt/wine-dcomp/wine-d2d1-dcomp-*/{bin,lib,share} engine/alt/wine-dcomp/  # izravna strukturo
+rmdir engine/alt/wine-dcomp/wine-d2d1-dcomp-*
+# 2) zagon poljubnega ukaza z njim
+WINEFORGE_ENGINE=$PWD/engine/alt/wine-dcomp bin/wineforge run <igor>
+# 3) sonda kaj DComp zmore (prevaja jo csc.exe v prefixu)
+WINEPREFIX=$PWD/prefixes/<igor> engine/wine/bin/wine \
+  C:\\windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo \
+  /out:Z:\\tmp\\dprobe.exe /reference:System.Windows.Forms.dll \
+  /reference:System.Drawing.dll Z:\\tmp\\dprobe.exe
 ```
 
 ## Prenosnost

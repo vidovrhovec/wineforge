@@ -3458,7 +3458,7 @@ class VirtualPad:
 
 
 def pad_kernel():
-    """Je nasa naprava ze v jedru? vrne (ime, handlerji) ali None."""
+    """Je naša naprava že v jedru? vrne vozlišči (npr. 'event20 js0') ali None."""
     try:
         txt = Path("/proc/bus/input/devices").read_text()
     except OSError:
@@ -3484,7 +3484,7 @@ def pad_pids():
 
 
 def pad_send(cmd):
-    """Poslje ukaz zagnanemu pad daemonu."""
+    """Pošlje ukaz zagnanemu pad daemonu."""
     import socket
     if not PAD_SOCK.exists():
         return False, "pad ni zagnan (wineforge pad --start)"
@@ -3501,7 +3501,7 @@ def pad_send(cmd):
 
 
 def pad_daemon(name=PAD_NAME):
-    """Ostané ziv in drzi napravo; sprejema ukaze po UNIX vticnici."""
+    """Ostane živ in drži napravo; sprejema ukaze po UNIX vtičnici."""
     import socket
     if PAD_SOCK.exists():
         try:
@@ -3513,8 +3513,8 @@ def pad_daemon(name=PAD_NAME):
         except OSError:
             PAD_SOCK.unlink()
     pad = VirtualPad(name)
+    PAD_PID.write_text(str(os.getpid()))     # najprej pid, da starš ne dirka v prazno
     pad.create()
-    PAD_PID.write_text(str(os.getpid()))
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(str(PAD_SOCK))
     os.chmod(PAD_SOCK, 0o600)
@@ -3551,7 +3551,7 @@ def pad_daemon(name=PAD_NAME):
             elif deli[0] == "dpad" and deli[1].lower() in PAD_DPAD:
                 pad.dpad(deli[1])
             elif deli[0] == "seq":
-                # seq A:0.2:400,B:0.2:200  -> pritisni, drzi, pauza (ms)
+                # seq A:0.2:400,B:0.2:200  -> pritisni, drži, pavza (ms)
                 for korak in ",".join(deli[1:]).split(","):
                     d = korak.split(":")
                     pad.tap(d[0], float(d[1]) if len(d) > 1 else 0.2)
@@ -3566,7 +3566,7 @@ def pad_daemon(name=PAD_NAME):
 
 
 def pad_pids_ok():
-    """Daemon ugasne, ce mu pid datoteka ne vec ne pripada (npr. znosen brisanje)."""
+    """Daemon ugasne, če mu pid datoteka ne več ne pripada (npr. zunanje brisanje)."""
     if not PAD_PID.exists():
         return False
     try:
@@ -3576,7 +3576,7 @@ def pad_pids_ok():
 
 
 def cmd_pad(args):
-    """Navidezni Xbox_ročko za windowske igre pod Wine (brez roota)."""
+    """Navidezni Xbox gamepad za windowske igre pod Wine (brez roota)."""
     if args.daemon:
         return pad_daemon(args.name or PAD_NAME)
     zivi = bool(pad_pids())
@@ -3589,13 +3589,13 @@ def cmd_pad(args):
                 subprocess.Popen([sys.executable, str(FORGE / "bin" / "wineforge"), "pad", "--daemon"],
                                  stdout=f, stderr=subprocess.STDOUT, start_new_session=True,
                                  cwd=str(FORGE))
-            for _ in range(15):
-                time.sleep(0.7)
-                if pad_kernel():
+            for _ in range(20):
+                time.sleep(0.5)
+                if pad_kernel() and pad_pids():
                     break
         roko = pad_kernel()
         if roko:
-            log(f"naprava v jedru: {PAD_NAME}  (vozlisci: {roko})")
+            log(f"naprava v jedru: {PAD_NAME}  (vozlišči: {roko})")
             log("Wine jo pokaže kot »Controller (XBox 360 for Windows)«")
         else:
             die("naprave ni bilo mogoče ustvariti — preveri, da je modul uinput naložen "
@@ -3641,8 +3641,6 @@ def cmd_pad(args):
     roko = pad_kernel()
     log("naprava v jedru: " + (roko if roko else "ne"))
     log("daemon: " + ("tece (pid " + str(pad_pids()[0]) + ")" if pad_pids() else "ne tece"))
-    if pad_pids() and roko:
-        ok, izpis = pad_send("ping")
     log("uporaba: wineforge pad --start, nato --press a | --axis lx 0.9 | --dpad desno | --seq a,b:0.2:600")
     return 0
 
@@ -3863,6 +3861,7 @@ def cmd_gui(args):
                           "Namestuj igro s CD/DVD ali ISO slike",
                           "Dopolni predvajanje videa (igre z uvodnimi videi)",
                           "Program naj misli, da je skrbnik (pravice + storitve)",
+                          "Navidezni gamepad (igre brez ročke)",
                           "Diagnoza (Wine, GPU, CUDA)",
                           "Zapri")
         if code != 0 or not choice.strip():
@@ -3979,6 +3978,16 @@ def cmd_gui(args):
             code, out = _wf("sim", name,
                             progress_msg=f"Urejam pravice in storitve za {name} ...")
             _show("Pravice in storitve — " + name, out)
+        elif c.startswith("Navidezni gamepad"):
+            if pad_pids():
+                _wf("pad", "--stop")
+                _show("Gamepad", "Izklopljen. Igre ga ne vidijo več.")
+            else:
+                code, out = _wf("pad", "--start",
+                                progress_msg="Ustvarjam navidezni gamepad ...")
+                _show("Gamepad", out +
+                      "\nIgre ga vidijo kot »Controller (XBox 360 for Windows)«.\n"
+                      "Vnosi: bin/wineforge pad --press a | --axis lx 0.9 | --dpad desno")
         elif c.startswith("Dopolni predvajanje"):
             code, out = _wf("media", "--fix",
                             progress_msg="Dopolnjujem predvajanje videa ...")
@@ -4410,7 +4419,7 @@ def build_parser():
                    help="utrdi identiteto stroja (MachineGuid, HwProfileGuid, InstallDate)")
     s.set_defaults(func=cmd_sim)
 
-    s = sub.add_parser("pad", help="navidezni Xbox_ročko za igre (uinput, brez roota)")
+    s = sub.add_parser("pad", help="navidezni Xbox gamepad za igre (uinput, brez roota)")
     s.add_argument("--start", action="store_true", help="ustvari napravo in zagni daemon")
     s.add_argument("--stop", action="store_true", help="ustavi daemona in odstrani napravo")
     s.add_argument("--daemon", action="store_true", help="notranji: drzi napravo (ne rabiš)")
