@@ -526,7 +526,7 @@ def auto_scale(name, meta=None):
     return False
 
 
-def app_run(name, args=None, debug=False):
+def app_run(name, args=None, debug=False, display=None):
     meta = app_load(name)
     if not meta:
         die(f"Aplikacija '{name}' ne obstaja. Uporabi: wineforge list")
@@ -541,7 +541,16 @@ def app_run(name, args=None, debug=False):
         target = meta["exe_win"]
     elif not exe.exists():
         die(f"Exe ne obstaja: {exe}")
-    env = meta.get("env", {})
+    env = dict(meta.get("env", {}) or {})
+    if display:
+        d = disp_find(display)
+        if not d:
+            die(f"navidezni zaslon '{display}' ne obstaja (wineforge display --list)")
+        if not disp_alive(d):
+            die(f"zaslon '{display}' (: {d['display']}) ne tece — zazeni ga z "
+                f"wineforge display --add --name {display}")
+        env["DISPLAY"] = f":{d['display']}"
+        log(f"na navideznem zaslonu :{d['display']} ({d['size'][0]}x{d['size'][1]})")
     cmd = [str(WINE), target] + list(args or [])
     if meta.get("args") and not args:
         cmd = [str(WINE), target] + list(meta["args"])
@@ -3645,6 +3654,355 @@ def cmd_pad(args):
     return 0
 
 
+# ------------------------------------------------- navidezni zaslon (IddCx) ----
+# Programi za predvajanje zaslona (StarDesk, Sunshine, Parsec) potrebujejo na
+# Windowsih navidezni monitor (IddCx gonilnik v jedru).  Pod Linuxom ga lahko
+# naredimo tudi brez roota in brez jedrskega modula (vkms bi rabil oboje):
+# Xwayland v koreninskem nacinu naredi okno s poljubno velikostjo, ki je hkrati
+# pravi X zaslon — na njem dela Vulkan/GL, vanj lahko vbrizgamo mis in
+# tipkovnico (XTEST) in ga zajamemo (ffmpeg x11grab).  Kar je za StarDesk
+# IddCx.gonilnik, je torej tukaj sestavljanje zaslona — enaka funkcija, brez
+# windowskega jedra in brez virtualnega racunalnika.
+
+DISPLAYS = DATA / "displays.json"
+
+
+class Xlib:
+    """Ravni Xlib/XTEST prek ctypes (ne rabimo python-xliba, ne roota)."""
+
+    def __init__(self, num):
+        self.x11 = ctypes.CDLL("libX11.so.6")
+        X = ctypes
+        self.x11.XOpenDisplay.restype = X.c_void_p
+        self.x11.XOpenDisplay.argtypes = [X.c_char_p]
+        self.x11.XDefaultRootWindow.restype = X.c_ulong
+        self.x11.XDefaultRootWindow.argtypes = [X.c_void_p]
+        self.x11.XDisplayWidth.restype = X.c_int
+        self.x11.XDisplayWidth.argtypes = [X.c_void_p, X.c_int]
+        self.x11.XDisplayHeight.restype = X.c_int
+        self.x11.XDisplayHeight.argtypes = [X.c_void_p, X.c_int]
+        self.x11.XCloseDisplay.argtypes = [X.c_void_p]
+        self.x11.XFlush.argtypes = [X.c_void_p]
+        self.x11.XQueryTree.restype = X.c_int
+        self.x11.XQueryTree.argtypes = [X.c_void_p, X.c_ulong] + [X.c_void_p] * 4
+        self.x11.XGetGeometry.restype = X.c_int
+        self.x11.XGetGeometry.argtypes = [X.c_void_p, X.c_ulong, X.POINTER(X.c_void_p),
+                                          X.POINTER(X.c_short), X.POINTER(X.c_short),
+                                          X.POINTER(X.c_ushort), X.POINTER(X.c_ushort),
+                                          X.POINTER(X.c_ushort), X.POINTER(X.c_ushort)]
+        self.x11.XFree.argtypes = [X.c_void_p]
+        self.x11.XQueryPointer.restype = X.c_int
+        self.x11.XQueryPointer.argtypes = [X.c_void_p, X.c_ulong] + [X.c_void_p] * 7
+        self.dpy = self.x11.XOpenDisplay(f":{num}".encode())
+        if not self.dpy:
+            raise ConnectionError(f"prikaz :{num} ni dosegljiv")
+        self.root = self.x11.XDefaultRootWindow(self.dpy)
+
+    def size(self):
+        return (self.x11.XDisplayWidth(self.dpy, 0), self.x11.XDisplayHeight(self.dpy, 0))
+
+    def windows(self):
+        """Vidni vrhnji okni na tem zaslonu: [(id, sirina, visina), ...]."""
+        kids = ctypes.c_void_p()
+        n = ctypes.c_uint()
+        if not self.x11.XQueryTree(self.dpy, self.root, ctypes.byref(ctypes.c_void_p()),
+                                   ctypes.byref(ctypes.c_void_p()), ctypes.byref(kids),
+                                   ctypes.byref(n)):
+            return []
+        izpis = []
+        for i in range(n.value):
+            w = ctypes.cast(kids, ctypes.POINTER(ctypes.c_ulong))[i]
+            d = ctypes.c_void_p()
+            x = ctypes.c_short()
+            y = ctypes.c_short()
+            s = ctypes.c_ushort()
+            v = ctypes.c_ushort()
+            b = ctypes.c_ushort()
+            p = ctypes.c_ushort()
+            if self.x11.XGetGeometry(self.dpy, w, ctypes.byref(d), ctypes.byref(x),
+                                     ctypes.byref(y), ctypes.byref(s), ctypes.byref(v),
+                                     ctypes.byref(b), ctypes.byref(p)) and s.value >= 32 and v.value >= 32:
+                izpis.append((w, s.value, v.value))
+        self.x11.XFree(kids)
+        return izpis
+
+    def pointer(self):
+        r = ctypes.c_void_p()
+        c = ctypes.c_void_p()
+        px, py, ax, ay = (ctypes.c_int() for _ in range(4))
+        m = ctypes.c_uint()
+        self.x11.XQueryPointer(self.dpy, self.root, ctypes.byref(r), ctypes.byref(c),
+                              ctypes.byref(px), ctypes.byref(py), ctypes.byref(ax),
+                              ctypes.byref(ay), ctypes.byref(m))
+        return px.value, py.value
+
+    def _tst(self):
+        if not hasattr(self, "_t"):
+            t = ctypes.CDLL("libXtst.so.6")
+            t.XTestQueryExtension.restype = ctypes.c_int
+            t.XTestQueryExtension.argtypes = [ctypes.c_void_p] + [ctypes.c_void_p] * 4
+            a = b = c = d = ctypes.c_int()
+            if not t.XTestQueryExtension(self.dpy, ctypes.byref(a), ctypes.byref(b),
+                                        ctypes.byref(c), ctypes.byref(d)):
+                raise RuntimeError("streznik nima raziritve XTEST")
+            t.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                               ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+            t.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                               ctypes.c_int, ctypes.c_ulong]
+            t.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                            ctypes.c_int, ctypes.c_ulong]
+            self._t = t
+        return self._t
+
+    def warp(self, x, y):
+        self._tst().XTestFakeMotionEvent(self.dpy, 0, int(x), int(y), 0)
+        self.x11.XFlush(self.dpy)
+
+    def click(self, button=1, down=True):
+        self._tst().XTestFakeButtonEvent(self.dpy, int(button), 1 if down else 0, 0)
+        self.x11.XFlush(self.dpy)
+
+    def key(self, keycode, down=True):
+        self._tst().XTestFakeKeyEvent(self.dpy, int(keycode), 1 if down else 0, 0)
+        self.x11.XFlush(self.dpy)
+
+    def close(self):
+        with contextlib.suppress(OSError):
+            self.x11.XCloseDisplay(self.dpy)
+
+
+def disp_load():
+    try:
+        return json.loads(DISPLAYS.read_text()).get("displays", [])
+    except (OSError, ValueError):
+        return []
+
+
+def disp_save(sezn):
+    DATA.mkdir(parents=True, exist_ok=True)
+    DISPLAYS.write_text(json.dumps({"displays": sezn}, indent=1))
+
+
+def disp_set(ime, **kw):
+    """Posodobi zapis zaslona v data/displays.json."""
+    sezn = disp_load()
+    for d in sezn:
+        if d.get("name") == ime:
+            d.update(kw)
+    disp_save(sezn)
+
+
+def disp_find(ime=None, number=None):
+    for d in disp_load():
+        if ime and d.get("name") == ime:
+            return d
+        if number is not None and d.get("display") == number:
+            return d
+    return None
+
+
+def disp_free_num():
+    for n in range(7, 60):
+        if not Path(f"/tmp/.X{n}-lock").exists():
+            return n
+    return 99
+
+
+def disp_x(d):
+    """Povezavo na prikaz; vrne Xlib ali None."""
+    try:
+        return Xlib(d["display"])
+    except (ConnectionError, OSError):
+        return None
+
+
+def disp_alive(d):
+    x = disp_x(d)
+    if not x:
+        return None
+    try:
+        vel = x.size()
+        return vel
+    finally:
+        x.close()
+
+
+def disp_supervise(ime):
+    """Drzi navidezni zaslon pokonci: ces Xwayland umre ga zazene nazaj."""
+    d = disp_find(ime)
+    if not d:
+        die(f"navidezni zaslon {ime} ne obstaja")
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        log("ni WAYLAND_DISPLAY — koreninski Xwayland rabuje sejo Wayland")
+        return 1
+    stevilo = 0
+    disp_set(ime, sup=os.getpid())
+    while disp_find(ime):
+        st = d["display"]
+        okna = [f":{st}"]
+        if d.get("fullscreen"):
+            okna += ["-fullscreen"]
+        else:
+            okna += ["-geometry", f"{d['size'][0]}x{d['size'][1]}", "-decorate"]
+        LOGS.mkdir(parents=True, exist_ok=True)
+        with open(LOGS / f"display-{ime}.log", "a") as f:
+            log(f"zaganjam navidezni zaslon :{st} ({d['size'][0]}x{d['size'][1]}) ...")
+            pr = subprocess.Popen(["Xwayland"] + okna, stdout=f, stderr=subprocess.STDOUT,
+                                  start_new_session=True)
+            disp_set(ime, pid=pr.pid)
+            pr.wait()
+        stevilo += 1
+        if not disp_find(ime) or stevilo > 50:
+            break
+        time.sleep(1.2)
+        d = disp_find(ime)
+    return 0
+
+
+def disp_shot(d, izhod=None, poskusi_okno=True):
+    """Zajame zaslon (ali najvecje okno) in vrne pot do slike."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        die("za zajem rabujem ffmpeg (pacman -S ffmpeg)")
+    x = disp_x(d)
+    if not x:
+        die(f"zaslon :{d['display']} ne tece")
+    try:
+        s, v = x.size()
+        okna = sorted(x.windows(), key=lambda t: -t[1] * t[2])
+    finally:
+        x.close()
+    ukaz = [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "x11grab",
+            "-video_size", f"{s}x{v}", "-i", f":{d['display']}.0"]
+    if poskusi_okno and okna:
+        ukaz += ["-window_id", str(okna[0][0])]
+    izhod = izhod or str(DATA / f"zaslon-{d['name']}.png")
+    ukaz += ["-frames:v", "1", izhod, "-y"]
+    r = run(ukaz, capture=True)
+    if r[0] or not Path(izhod).exists():
+        die("zajem ni uspel: " + (r[1] or "")[-300:])
+    return izhod, (s, v), okna
+
+
+def cmd_display(args):
+    """Navidezni zaslon — linuxni ustreznik IddCx (za predvajanje brez monitorja)."""
+    if args.supervise:
+        return disp_supervise(args.supervise)
+    if args.add:
+        if not os.environ.get("WAYLAND_DISPLAY"):
+            die("ta nac rabuje sejo Wayland (koreninski Xwayland)")
+        if not shutil.which("Xwayland"):
+            die("v sistemu ni Xwaylanda")
+        if args.add.lower() == "fullscreen":
+            velikost, celozaslonski = [1920, 1080], True
+        else:
+            with contextlib.suppress(ValueError):
+                sir, vis = args.add.lower().split("x")
+                velikost, celozaslonski = [int(sir), int(vis)], False
+        ime = args.name or f"zaslon{disp_free_num()}"
+        if disp_find(ime):
+            die(f"zaslon z imenom {ime} ze obstaja")
+        nov = {"name": ime, "display": disp_free_num(), "size": velikost,
+               "fullscreen": celozaslonski}
+        disp_load()
+        DATA.mkdir(parents=True, exist_ok=True)
+        sezn = disp_load()
+        sezn.append(nov)
+        disp_save(sezn)
+        LOGS.mkdir(parents=True, exist_ok=True)
+        with open(LOGS / f"display-{ime}.log", "a") as f:
+            subprocess.Popen([sys.executable, str(FORGE / "bin" / "wineforge"), "display",
+                              "--supervise", ime], stdout=f, stderr=subprocess.STDOUT,
+                             start_new_session=True, cwd=str(FORGE))
+        for _ in range(30):
+            time.sleep(0.6)
+            if disp_alive(nov):
+                break
+        tekoc = disp_alive(nov)
+        if not tekoc:
+            warn("zaslon se se ne odziva (Xwayland morda se vedno vstaja) — preveri "
+                 "wineforge display --list in data/logs/" + f"display-{ime}.log")
+            return 1
+        log(f"navidezni zaslon '{ime}' → prikaz :{nov['display']}  {tekoc[0]}x{tekoc[1]}")
+        log("uporaba:  DISPLAY=:" + str(nov['display']) + " <program>   ali   "
+            "wineforge run <igor> --display " + ime)
+        log("zajem:    wineforge display --shot --name " + ime)
+        return 0
+    if args.remove:
+        sezn = disp_load()
+        obl = [d for d in sezn if d["name"] != args.remove and args.remove != "vse"]
+        if len(obl) == len(sezn):
+            die(f"zaslon {args.remove} ne obstaja")
+        disp_save(obl)          # najprej uscni iz seznama, da nadzornik ne zazene nazaj
+        for d in sezn:
+            if d["name"] == args.remove or args.remove == "vse":
+                for pids in (d.get("pid"), d.get("sup")):
+                    with contextlib.suppress(OSError):
+                        if pids and pids > 100:
+                            os.kill(pids, 15)
+                with contextlib.suppress(OSError):
+                    run(["pkill", "-f", f"Xwayland :{d['display']}"], capture=True)
+        disp_save(obl)
+        log("zaprto")
+        return 0
+    if args.list or not any((args.add, args.remove, args.shot is not None, args.video,
+                            args.move, args.click is not None, args.key is not None,
+                            args.status)):
+        sezn = disp_load()
+        if not sezn:
+            log("ni navideznih zaslonov (ustvari z: wineforge display --add 1920x1080)")
+            return 0
+        for d in sezn:
+            tekoc = disp_alive(d)
+            log(f"{d['name']:14} :{d['display']:<3} {'OK  ' + str(tekoc[0]) + 'x' + str(tekoc[1]) if tekoc else 'ne tece'}"
+                f"  {'celozaslonsko' if d.get('fullscreen') else str(d['size'][0]) + 'x' + str(d['size'][1])}")
+        return 0
+    d = disp_find(args.name, args.display)
+    if not d:
+        die("daj --name <ime> ali --display <stevilo> (wineforge display --list)")
+    if args.shot is not None:
+        pot, vel, okna = disp_shot(d, args.shot or None)
+        log(f"zajeto: {pot}  ({vel[0]}x{vel[1]}, odprta okna: {len(okna)})")
+        return 0
+    if args.video:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            die("rabujem ffmpeg")
+        x = disp_x(d)
+        s, v = x.size()
+        x.close()
+        pot = args.out or f"zaslon-{d['name']}.mp4"
+        log(f"snemam {args.sekunde}s zaslona :{d['display']} v {pot} ...")
+        run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "x11grab",
+             "-framerate", "30", "-video_size", f"{s}x{v}", "-i", f":{d['display']}.0",
+             "-t", str(args.sekunde), "-pix_fmt", "yuv420p", "-y", pot])
+        log("posneto: " + pot + (f" ({Path(pot).stat().st_size} B)" if Path(pot).exists() else ""))
+        return 0
+    x = disp_x(d)
+    if not x:
+        die(f"zaslon :{d['display']} ne tece")
+    if args.move:
+        x.warp(args.move[0], args.move[1])
+        log(f"kaza na {x.pointer()}")
+    if args.click:
+        x.click(args.click)
+        x.click(args.click, False)
+        log(f"klik {args.click}")
+    if args.key:
+        x.key(args.key)
+        x.key(args.key, False)
+        log(f"tipka {args.key}")
+    if args.status:
+        tekoc = disp_alive(d)
+        log(f"prikaz :{d['display']}  {'zivi ' + str(tekoc) if tekoc else 'ne tece'}")
+        x2 = disp_x(d)
+        if x2:
+            log(f"okna: {len(x2.windows())}  kaza: {x2.pointer()}")
+            x2.close()
+    x.close()
+    return 0
+
+
 # ------------------------------------------------------------------- GUI ----
 
 def _dialog():
@@ -3862,6 +4220,7 @@ def cmd_gui(args):
                           "Dopolni predvajanje videa (igre z uvodnimi videi)",
                           "Program naj misli, da je skrbnik (pravice + storitve)",
                           "Navidezni gamepad (igre brez ročke)",
+                          "Navidezni zaslon (predvajanje brez monitorja)",
                           "Diagnoza (Wine, GPU, CUDA)",
                           "Zapri")
         if code != 0 or not choice.strip():
@@ -3978,6 +4337,14 @@ def cmd_gui(args):
             code, out = _wf("sim", name,
                             progress_msg=f"Urejam pravice in storitve za {name} ...")
             _show("Pravice in storitve — " + name, out)
+        elif c.startswith("Navidezni zaslon"):
+            if disp_load():
+                _wf("display", "--remove", "vse")
+                _show("Navidezni zaslon", "Zaprt.")
+            else:
+                code, out = _wf("display", "--add", "1920x1080", "--name", "prenos",
+                                progress_msg="Ustvarjam navidezni zaslon ...")
+                _show("Navidezni zaslon", out)
         elif c.startswith("Navidezni gamepad"):
             if pad_pids():
                 _wf("pad", "--stop")
@@ -4071,7 +4438,7 @@ def cmd_add(args):
 
 
 def cmd_run(args):
-    code = app_run(args.name, args.args, debug=args.debug)
+    code = app_run(args.name, args.args, debug=args.debug, display=getattr(args, "display", None))
     if code and code != 0:
         warn("Namig: če se okno prikaže prazno/belo, poženi: wineforge repair " + args.name)
     return code
@@ -4286,6 +4653,8 @@ def build_parser():
     s = sub.add_parser("run", help="zaženi aplikacijo")
     s.add_argument("name")
     s.add_argument("--debug", action="store_true")
+    s.add_argument("--display", metavar="IME",
+                   help="zaženi na navideznem zaslonu (wineforge display --add)")
     s.add_argument("args", nargs=argparse.REMAINDER)
     s.set_defaults(func=cmd_run)
 
@@ -4432,6 +4801,24 @@ def build_parser():
     s.add_argument("--seq", metavar="NIZ", help="niz: a:0.2:400,b:0.2:200 (gumb:pritisk:pavza_ms)")
     s.add_argument("--demo", action="store_true", help="pošlji nekaj vnosov za preizkus")
     s.set_defaults(func=cmd_pad)
+
+    s = sub.add_parser("display", help="navidezni zaslon (IddCx ustreznik) za igre in predvajanje")
+    s.add_argument("--add", metavar="SIRINAxVISINA | fullscreen", help="ustvari navidezni zaslon")
+    s.add_argument("--name", metavar="IME", help="ime zaslona")
+    s.add_argument("--display", type=int, metavar="N", help="prikaz :N (za --shot, --move ...)")
+    s.add_argument("--remove", metavar="IME | vse", help="zapre zaslon(e)")
+    s.add_argument("--list", action="store_true", help="nasteje zaslone")
+    s.add_argument("--status", action="store_true", help="stanje izbranega zaslona")
+    s.add_argument("--shot", nargs="?", const="", metavar="DATOTEKA",
+                   help="zajame sliko zaslona (privzeto data/zaslon-<ime>.png)")
+    s.add_argument("--video", action="store_true", help="posname video zaslona")
+    s.add_argument("--sekunde", type=int, default=10, metavar="S", help="dolžina posnetka")
+    s.add_argument("--out", metavar="DATOTEKA", help="izhodna datoteka za --video")
+    s.add_argument("--move", nargs=2, type=int, metavar=("X", "Y"), help="premakni kazo (XTEST)")
+    s.add_argument("--click", nargs="?", type=int, const=1, metavar="GUMB", help="klik (XTEST)")
+    s.add_argument("--key", type=int, metavar="KODA", help="pošlji tipko (XTEST, X keysym koda)")
+    s.add_argument("--supervise", metavar="IME", help=argparse.SUPPRESS)
+    s.set_defaults(func=cmd_display)
 
     return p
 

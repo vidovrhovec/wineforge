@@ -81,6 +81,7 @@ odpre okno. Nič ročnega pisanja v terminal.
 | `media` | preveri/dopolni predvajanje videa v igrah (`--fix`, brez roota) |
 | `sim` | skrbniške pravice + windows storitev + identiteta (`--verify`, `--win`, `--pin`) |
 | `pad` | navidezni Xbox gamepad za igre (`--start`, `--press`, `--axis`, `--dpad`, `--seq`) |
+| `display` | navidezni zaslon, ustreznik IddCx (`--add`, `--shot`, `--video`, `--move`, `--click`) |
 | `deps` | iz PE uvozov ugotovi, katere komponente program potrebuje |
 | `bake` | zgradi/posodobi predlogo prefixa; `--compact` varčuje ~150 MB |
 | `prefix` | `list`, `new`, `delete`, `shell`, `explorer`, `tweaks` |
@@ -428,6 +429,54 @@ WINEPREFIX=$PWD/prefixes/<igor> engine/wine/bin/wine \
   /out:Z:\\tmp\\dprobe.exe /reference:System.Windows.Forms.dll \
   /reference:System.Drawing.dll Z:\\tmp\\dprobe.exe
 ```
+
+## Navidezni zaslon (`display`) — ustreznik `SDIddDriver` / IddCx
+
+Programi za predvajanje zaslona (StarDesk, Sunshine, Parsec) imajo na Windowsih
+navidezni monitor, ki ga naredi **jedrski gonilnik IddCx**. Pod Linuxom bi ga
+naredil `vkms` — a ta rabi roota in jedrski modul. WineForge ga naredi ravno
+korak nizje in **brez roota**: `Xwayland` v koreninskem nacinu naredi okno s
+poljubno velikostjo, ki je hkrati **pravi X zaslon** — GPU na njem dela, vanj
+lahko vbrizgamo mis in tipkovnico, in ga lahko zajamemo.
+
+```bash
+wineforge display --add 1920x1080 --name prenos   # ustvari zaslon (in nadzornika)
+wineforge run igra --display prenos               # zaženi igro NA njem
+wineforge display --shot --name prenos            # slika zaslona
+wineforge display --video --sekunde 20 --out posnetek.mp4
+wineforge display --move 800 400 --name prenos    # mis (XTEST)
+wineforge display --click --name prenos
+wineforge display --key 39 --name prenos          # X keysym koda
+wineforge display --list / --remove prenos | vse
+```
+
+Izmerjeno 22. 11. 2026 na tem sistemu (EndeavourOS, Wayland, RTX 3090):
+
+| preizkus | rezultat |
+|---|---|
+| zagon | `--add 1280x720` → prikaz `:7`, **točno 1280×720**, stabilno |
+| pospeševanje | `vkcube --wsi xcb` na tem zaslonu: »Selected GPU 0: NVIDIA GeForce RTX 3090«, izhod 0 → **Vulkan WSI dela, torej dela tudi DXVK** |
+| Wine | `DISPLAY=:7 wine notepad.exe` in `wineforge run --display` → okna se rišejo na navidezni zaslon |
+| zajem | `--shot` → PNG 1280×720 **z vsebino in kazalcem** (ne črno) |
+| video | `--video --sekunde 4` → **120 sličic = 30 fps** pri 1280×720 |
+| vnos | XTEST: kaza se je premaknila na (800,400), klik in tipka sprejeta |
+| odpornost | `kill -9` Xwaylandu → nadzornik ga v ~6 s pobudi nazaj, zajem po tem deluje |
+
+S tem je trojica, ki jo StarDesk počne z jedrnimi gonilniki, pokrita brez
+windowskega jedra in brez virtualnega računalnika:
+
+| StarDesk na Windowsih | tu |
+|---|---|
+| `SDIddDriver.sys` / IddCx (navidezni monitor) | `wineforge display` (Xwayland rootful) |
+| `sdvhid.sys` / `ViGEmBus.sys` (navidezna tipkovnica, miš, ročka) | `wineforge pad` (`/dev/uinput`) |
+| zajem + stream | `display --video` / `--shot` (ffmpeg x11grab) |
+
+**Kaj je drugače od jedrskega gonilnika (pošteno):** zaslon je sestavljen na
+ravni sejanja, ne na DRM CRTC-ju. Program, ki našteva monitorje prek DRM
+(`kscreen-doctor`, `xrandr` na pravih izhodih) ali gre v **exclusive fullscreen**,
+jega ne bo videl — navidezni zaslon je okno v seji. Za resnično glavo brez
+monitorja dodaš `--add fullscreen` (pokrije cel zaslon), pravo jedrsko
+rešitev (`vkms`, DRM lease) pa dobiš samo z rootom in modulom.
 
 ## Prenosnost
 
