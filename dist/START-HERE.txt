@@ -1,0 +1,49 @@
+WineForge 0.1.0 — prenosni Wine za enega samega uporabnika
+==========================================================
+
+1) Razširi to mapo nekam, kjer imaš prostor (domača mapa, USB …).
+2) Prvi zagon (samo enkrat, v terminalu):
+
+     cd wineforge
+     ./wineforge setup
+
+   WineForge prenese motor (Wine 11.22 + DXVK + VKD3D + winetricks + predlogo
+   prefixa, ~1.7 GB) in vse preveri. Traja nekaj minut.
+
+3) Naprej vse delaš z ikono "WineForge" (na namizju in v meniju):
+   Namesti program / Zaženi / Dodaj / Disk CD-DVD ali ISO / Predpone / Doctor …
+
+Namestitev programa v terminalu (če raje):
+     ./bin/wineforge install "/pot/do/ProgramSetup.exe"
+     ./bin/wineforge run <ime>
+
+IGRE
+  ./bin/wineforge media --fix    enkrat pripelje manjkajoče kodeke za video
+                                 (brez tega igre padejo z "Failed to create
+                                 SourceReader with registered byte stream
+                                 handler")
+  ./bin/wineforge disc           igra na pravem CD/DVD ali ISO:
+       ./bin/wineforge disc --iso ~/igre/igra.iso
+       ./bin/wineforge disc --install --name igra
+  DLSS / sevanje žarkov (NVIDIA) je vgrajeno samodejno (DXVK-NVAPI).
+  Vse teče lokalno na tvojem računalniku — to NI streaming.
+
+Program takoj umre, brez okna in brez sporočila? Vcasih hoce windows
+storitev ali prijavo, ki je Wine sam ne zna:
+  ./bin/wineforge sim  <ime>           # programska storitev + skrbniske pravice
+  ./bin/wineforge sspi <ime> --test    # NTLM/Negotiate prijava med klientom
+                                       # in storitvijo (Wine vrne napako)
+
+Igra hoče ročko, je pa nimaš?        ./bin/wineforge pad --start
+Predvajaš brez monitorja?            ./bin/wineforge display --add 1920x1080 --name prenos
+Igre z DVD-ja ali ISO slike?         ./bin/wineforge disc --iso neka_igra.iso
+
+Težave: ./bin/wineforge doctor --fix
+Dnevniki: data/logs/
+Dokumentacija: README.md (poglavje "Igre in diski")
+
+OPOMBA: programi, ki za vmesnik uporabljajo Microsoft Edge WebView2
+(Epic Games Launcher 2.x, Microsoft Teams …), se v Wineu NE izrišejo —
+to je omejitev Winea (bug 59370), ne WineForge. Za Epic uporabi uradni
+Linux AppImage: https://launcher.epicgames.com/
+Prav tako igre z jedrskim anti-cheatom (EAC, BattlEye, Vanguard) ne tečejo.
