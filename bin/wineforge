@@ -2835,15 +2835,62 @@ def svc_info(prefix, name):
     return info or None
 
 
+def svc_scm_path(prefix, name, exe_win):
+    """Wineov SCM ne zna razčleniti navedene poti ("C:\\Program Files\\..."), zato
+    storitvi priskrbimo pot brez presledkov: C:\\wfsvc\\<ime>\\x.exe -> prava mapa.
+    Preslikati moramo celotno mapo, ne le binarke: Windows išče sosednje DLL-je
+    v mapi izvajalne datoteke, sicer ugasne tiho (napaka 1053 / brez procesa)."""
+    pot = exe_win.strip('"').replace("/", "\\")
+    if " " not in pot:
+        return pot
+    rel = pot[2:] if re.match(r"^[A-Za-z]:", pot) else pot
+    celi = Path(prefix) / "drive_c" / rel.lstrip("\\").replace("\\", "/")
+    mapa, dat = celi.parent, celi.name
+    if not celi.exists() or not mapa.is_dir():
+        return pot
+    koren = Path(prefix) / "drive_c" / "wfsvc"
+    ime = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    try:
+        koren.mkdir(parents=True, exist_ok=True)
+        po = koren / ime
+        if po.is_symlink() or po.exists():
+            po.unlink()
+        po.symlink_to(mapa.resolve())
+    except OSError:
+        return pot
+    return "C:\\wfsvc\\" + ime + "\\" + dat
+
+
 def svc_add(prefix, name, exe_win, auto=True):
     """Registrira windows storitev v prefixu (enako kot `sc create`)."""
     ok = True
-    ok &= reg_add(prefix, svc_key(name), "ImagePath", exe_win, "REG_EXPAND_SZ")
+    ok &= reg_add(prefix, svc_key(name), "ImagePath",
+                  svc_scm_path(prefix, name, exe_win), "REG_EXPAND_SZ")
+    ok &= reg_add(prefix, svc_key(name), "WfRealPath", exe_win, "REG_SZ")
     ok &= reg_add(prefix, svc_key(name), "Type", "16", "REG_DWORD")       # WIN32_OWN_PROCESS
     ok &= reg_add(prefix, svc_key(name), "Start", "2" if auto else "3", "REG_DWORD")
     ok &= reg_add(prefix, svc_key(name), "ErrorControl", "1", "REG_DWORD")
     ok &= reg_add(prefix, svc_key(name), "ObjectName", "LocalSystem")
     return bool(ok)
+
+
+def svc_scm_boot(prefix, exe_win=None, wait=26):
+    """Ponovno zažene prefix, da SCM sam porine Start=2 storitve (pravi zagon).
+    Ustavi vse, kar v tem prefixu že teče."""
+    if exe_win:
+        for pid in proc_pids(exe_win, prefix):
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+    wineserver_kill(prefix)
+    time.sleep(2)
+    wine(["cmd", "/c", "ping -n 12 127.0.0.1"], prefix=prefix, capture=True)
+    for _ in range(wait):
+        if exe_win and proc_pids(exe_win, prefix):
+            return True
+        time.sleep(1)
+    return bool(proc_pids(exe_win, prefix)) if exe_win else False
 
 
 def svc_remove(prefix, name):
@@ -2897,16 +2944,19 @@ def svc_spawn(prefix, name, exe_win, args=None):
 
 
 def svc_stop(prefix, name, exe_win=None):
-    for pid in proc_pids(exe_win or name, prefix):
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
+    for extra in (exe_win or name, "wfsvc\\" + re.sub(r"[^A-Za-z0-9._-]", "_", name)):
+        for pid in proc_pids(extra, prefix):
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
     wine(["sc", "stop", name], prefix=prefix, capture=True)
 
 
 def svc_ensure(prefix, name, exe_win, auto=True, wait=8, args=None):
-    """Poskrbi, da storitev obstaja v SCM in da ji proces tece."""
+    """Poskrbi, da storitev obstaja v SCM in da ji proces teče.
+    Če že teče (npr. SCM ga je zagnal ob zagonu prefixa), ga NIKOLI ne podvojimo:
+    dva hkrati pokončata marsateri klient (izmerjeno pri StarDesk)."""
     if not svc_info(prefix, name):
         svc_add(prefix, name, exe_win, auto)
         log(f"    storitev '{name}' registrirana v SCM ({exe_win})")
@@ -3017,10 +3067,12 @@ def sim_status(prefix, svcs):
         pids = proc_pids(s["exe"], prefix)
         stanje = word or "ni registrirana"
         if pids and word != "RUNNING":
-            stanje = "RUNNING (simulirano)"
+            stanje = "RUNNING"
+        opomba = "" if s.get("auto", True) else " [ročni zagon]"
+        if len(pids) > 1:
+            opomba += f"  POZOR: {len(pids)} instance hkrati (klient lahko umre)"
         lines.append(f"  storitev {s['name']}: {stanje}"
-                     + (f", pid {' '.join(map(str, pids))}" if pids else "")
-                     + ("" if s.get("auto", True) else " [ročni zagon]"))
+                     + (f", pid {' '.join(map(str, pids))}" if pids else "") + opomba)
     return "\n".join(lines)
 
 # ------ pogled programa (kaj vidi program) + identiteta/stroj "lažnega" ------
@@ -3316,6 +3368,27 @@ def cmd_sim(args):
 
     if args.win and not win_apply(prefix, args.win):
         warn(f"Neznan profil Windowsa '{args.win}' (poznam: " + ", ".join(WIN_PROFILES) + ")")
+    if args.scm:
+        if not svcs:
+            warn("ni registrirane storitve — dodaj jo: --svc \"IME=C:\\pot\\x.exe\"")
+        for s in svcs:
+            svc_add(prefix, s["name"], s["exe"], True)
+            log(f"storitev '{s['name']}' pripravljena (Start=2, ImagePath brez "
+                "presledkov -> C:\\wfsvc)")
+        log("ponovno zaganjam prefix, da SCM sam porine storitve ...")
+        svc_scm_boot(prefix)
+        for _ in range(20):
+            if all(proc_pids(s["exe"], prefix) for s in svcs):
+                break
+            time.sleep(1)
+        for s in svcs:
+            pids = proc_pids(s["exe"], prefix)
+            if pids:
+                log(f"  {s['name']}: SCM jo je zagnal v resnici, pid "
+                    + " ".join(map(str, pids)) + " (enkrat, dokler tece prefix)")
+            else:
+                warn(f"  {s['name']}: SCM je ni zagnal (se ne javi SCM-ju) — "
+                     "zaženi jo navadno: wineforge sim " + args.name)
     if args.pin:
         created = identity_pin(prefix)
         log("Identiteta stroja: " + ("dodano " + ", ".join(created) if created
@@ -4922,6 +4995,8 @@ def build_parser():
                    help="napiši masko Windowsa (nekateri programi zavrnejo starejše)")
     s.add_argument("--pin", action="store_true",
                    help="utrdi identiteto stroja (MachineGuid, HwProfileGuid, InstallDate)")
+    s.add_argument("--scm", action="store_true",
+                   help="naj storitev zažene pravi SCM (ob zagonu prefixa, pot brez presledkov)")
     s.set_defaults(func=cmd_sim)
 
     s = sub.add_parser("sspi", help="delujoč NTLM/Negotiate med klientom in storitvijo")

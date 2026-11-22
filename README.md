@@ -79,7 +79,7 @@ odpre okno. Nič ročnega pisanja v terminal.
 | `install` | zažene installer in iz njega naredi prenosno aplikacijo (`--no-shortcut`) |
 | `disc` | igre s CD/DVD ali ISO: `--iso`, `--install`, `--link`, `--eject` |
 | `media` | preveri/dopolni predvajanje videa v igrah (`--fix`, brez roota) |
-| `sim` | skrbniške pravice + windows storitev + identiteta (`--verify`, `--win`, `--pin`) |
+| `sim` | skrbniške pravice + windows storitev + identiteta (`--verify`, `--win`, `--pin`, `--scm`) |
 | `pad` | navidezni Xbox gamepad za igre (`--start`, `--press`, `--axis`, `--dpad`, `--seq`) |
 | `display` | navidezni zaslon, ustreznik IddCx (`--add`, `--shot`, `--video`, `--move`, `--click`) |
 | `sspi` | delujoča NTLM/Negotiate prijava med klientom in storitvijo (`--test`, `--brez`, `--secret`) |
@@ -272,6 +272,28 @@ nesreči ne zažene `PsExec` ali kaj podobnega.
 4. **Raziskava** — `--verify` prevede in požene sondo v samem prefixu ter
    natisne, kaj program vidi; `--status` našteje jedrske gonilnike v
    namestitvi in ich linuxne ustreznike.
+
+### Naj storitev zažene pravi SCM — `sim <ime> --scm`
+
+Wineov `services.exe` storitve z `Start=2` **zares zažene sam** ob zagonu
+prefixa — ni jih treba držati kot navadne procese. Samo `ImagePath` mora bit
+napisan tako, da ga zna razčleniti. Izmerjeno:
+
+| `ImagePath` | kaj se zgodi |
+|---|---|
+| `"C:\Program Files\Firm\Storitev.exe"` (z narekovaji) | SCM ne zažene ničesar (`1053`) |
+| `C:\Program Files\Firm\Storitev.exe` (presledki) | ista zgodba |
+| `C:\wfsvc\Storitev.exe` (povezava do *binarke*) | ugasne tiho — manjkajo sosednje DLL |
+| `C:\wfsvc\Storitev\Storitev.exe` (povezava do *mape*) | **SCM jo zažene in živi** ✓ |
+
+Zato `--scm` naredi `C:\wfsvc\<ime>` → celotna mapa storitve, to pot zapiše v
+`ImagePath` in ponovno zažene prefix (`wineserver -k` + kratek `ping`), da jo
+SCM porine. `--status` nato pokaže **prave** pid-e; če jih ni, sporoči, naj
+uporabiš navadni zagon (storitev se namreč zna javiti le nekateri).
+
+Pomembno: **samo ena instanca**. `svc_ensure` zdaj nikoli ne podvoji že zagnane
+storitve — pri StarDesk je klient takoj umrl, ker so hkrati tekle štiri
+instance, z eno samo pa je končno pokazal okno.
 
 ### Kaj je izmerjeno (sonda v prefixu, Wine 11.22)
 
@@ -497,11 +519,29 @@ jedra in jih ne more naložiti. Za dva od njiju ima WineForge že **nativna
 ustreznika**: `wineforge pad` (uinput namesto ViGEmBus/sdvhid) in
 `wineforge display` (namesto IddCx).
 
+6. **Milenik (isti dan pozneje): okno se vendarle prikaže.** Ko je storitev
+   zagnana **prava** (`wineforge sim stardesk --scm`, tj. Wineov SCM) in ko teče
+   **samo ena** instanca, `bin\StarDesk.exe` odpre svoje uvodno okno z logotipom
+   StarDesk (~175×100) — zajeto na navideznem zaslonu `wineforge display`.
+   Pred tem je bil izid vedno koda 255 brez okna. Pogoj, da se to zgodi:
+
+   1. `wineforge sim stardesk --scm` — SCM zagnana storitev, ena instanca,
+   2. klient zagnan **iz svoje mape** (`cd ".../StarDesk/bin" && wine StarDesk.exe`),
+      sicer se konča takoj (koda 255),
+   3. navidezni zaslon (`wineforge display`), če monitorja ni.
+
+   Po uvodnem oknu se ustavi: `msedgewebview2.exe` se nikoli ne zažene (mapa
+   `EBWebView` ne nastane), Sentry pa je prazen (`breadcrumbs` 0 B, `errors: 0`)
+   — torej se je program sam odločil, da ne gre naprej. Glavni vmesnik je
+   WebView2, ki je pod Wineom bloiran (bug 59370), jedrski del (`sdvhid.sys`,
+   `ViGEmBus.sys`, `SDIddDriver`, `SDUSB*.sys`) pa ostaja nedosegljiv.
+
+
 Kaj bi še lahko poskusili (vrstni red po smislu):
 
-1. **Nadomestna SSPI knjižnica** — narejeno in deluje, glej poglavje
-   »SSPI, ki deluje« spodaj. Za StarDesk ni zadostovalo (klient do SSPI sploh ne
-   pride, glej meritev 5 zgoraj).
+1. **Nadomestna SSPI knjižnica** — narejeno in deluje (poglavje »SSPI, ki
+deluje« spodaj). Za StarDesk ni bila ovira (klient do SSPI ne pride), je pa
+odpravila tihe izhode drugih programov, ki se avtentikajo lokalno.
 2. **Pravi Windows v virtualnem racunalniku** — edina pot, ki res dobi jedro,
    gonilnike, UAC, SSPI in delujoč WebView2 hkrati. `/dev/kvm` je na voljo in
    procesor podpira VT-x; manjka še QEMU in Windows ISO.

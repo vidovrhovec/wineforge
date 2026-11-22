@@ -31,6 +31,7 @@ IGRE
 Program takoj umre, brez okna in brez sporočila? Vcasih hoce windows
 storitev ali prijavo, ki je Wine sam ne zna:
   ./bin/wineforge sim  <ime>           # programska storitev + skrbniske pravice
+  ./bin/wineforge sim  <ime> --scm     # naj storitev zažene pravi SCM (ena instanca)
   ./bin/wineforge sspi <ime> --test    # NTLM/Negotiate prijava med klientom
                                        # in storitvijo (Wine vrne napako)
 
