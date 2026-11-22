@@ -27,3 +27,8 @@ __pycache__/
 .DS_Store
 *.bak
 *.bak-*
+
+# ---- SSPI moduli (majhni, jih potrebuje `wineforge sspi`) ----
+!share/sspi/
+!share/sspi/*
+src/sspi/build/

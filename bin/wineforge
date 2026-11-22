@@ -3371,6 +3371,134 @@ def cmd_sim(args):
     return 0
 
 
+# ------------------------- prava NTLM/Negotiate pogajanja (nadomestni SSPI) --
+# Wine 11 goni NTLM/Negotiate prek LSA storitve, katere v vinu ni: posledica je
+# SEC_E_INVALID_HANDLE (0x80090301) že na prvem InitializeSecurityContext. To je
+# pogost razlog, da program z izhodno kodo 255 ali 1 odide, ne da bi prikazal
+# okno (Windows piše napako v svoj dnevnik, ki ga pod wineom nihče ne bere).
+# Nadomestni secur32.dll iz src/sspi/ pogajanja opravi sam (self-contained
+# protokol z HMAC overjanjem, sejnim ključem in šifriranjem), Schannel/TLS pa
+# posreduje Wineovemu modulu, da HTTPS in dpapi ostaneta prava.
+
+SSPI_DIR = SHARE / "sspi"
+SSPI_KLJUC = r"HKEY_CURRENT_USER\Software\Wine\DllOverrides"
+SSPI_REG = r"HKLM\SOFTWARE\WineForge\SSPI"
+
+
+def sspi_dir(prefix, bit):
+    return Path(prefix) / "drive_c" / "windows" / ("system32" if bit == 64 else "syswow64")
+
+
+def sspi_state(prefix):
+    """Vrne (vklopleno, kaj_je_narejenega)."""
+    narejeno = []
+    for bit in (64, 32):
+        d = sspi_dir(prefix, bit)
+        if (d / "secur32.original").exists():
+            narejeno.append(f"{bit}-bitni")
+    ov = reg_get(prefix, SSPI_KLJUC, "secur32") or ""
+    if not narejeno:
+        return False, "izklopljeno (Wineov pravi secur32)"
+    return True, ", ".join(narejeno) + "; preusmeritev=" + (ov or "ni")
+
+
+def sspi_on(prefix, secret=None):
+    """Vgradi nadomestni secur32 (izvirnik se shrani kot secur32.original)."""
+    if not (SSPI_DIR / "secur32-x64.dll").exists():
+        die(f"Nadomestni SSPI moduli manjkajo ({SSPI_DIR}).\n"
+            "  Zgradi jih: bash src/sspi/build.sh  (rabí engine/tools/llvm-mingw)")
+    for bit, dat in ((64, "secur32-x64.dll"), (32, "secur32-x86.dll")):
+        d = sspi_dir(prefix, bit)
+        if not d.is_dir():
+            continue
+        izvirnik = d / "secur32.dll"
+        if not (d / "secur32.original").exists():
+            if not izvirnik.exists():
+                continue
+            shutil.copy2(izvirnik, d / "secur32.original")
+        if not (d / "wine-secur32.dll").exists():
+            shutil.copy2(d / "secur32.original", d / "wine-secur32.dll")
+        shutil.copy2(SSPI_DIR / dat, izvirnik)
+    reg_add(prefix, SSPI_KLJUC, "secur32", "native,builtin")
+    if secret:
+        reg_add(prefix, SSPI_REG, "Secret", hashlib.sha256(secret.encode()).hexdigest(),
+                vtype="REG_BINARY")
+    return True
+
+
+def sspi_off(prefix):
+    """Povrni Wineov pravi secur32."""
+    for bit in (64, 32):
+        d = sspi_dir(prefix, bit)
+        star = d / "secur32.original"
+        if star.exists():
+            shutil.copy2(star, d / "secur32.dll")
+            star.unlink()
+    reg_delete(prefix, SSPI_KLJUC, "secur32")
+    return True
+
+
+def sspi_test(prefix, log_path=None):
+    """V prefixu poženi preizkus pogajanj; vrne (koda, izpis)."""
+    exe = SSPI_DIR / "wfsspi-test.exe"
+    if not exe.exists():
+        die(f"Preizkus {exe} manjka (zgradi z bash src/sspi/build.sh).")
+    tmp = Path(prefix) / "drive_c" / "temp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(exe, tmp / "wfsspi-test.exe")
+    env = {"WINEDLLOVERRIDES": "secur32=n,b"}
+    if log_path:
+        env["WINEFORGE_SSPI_LOG"] = wine_path(log_path)
+    return wine([r"C:\temp\wfsspi-test.exe"], prefix=prefix, env=env, capture=True)
+
+
+def cmd_sspi(args):
+    """Programu daj delujoč NTLM/Negotiate (klient-storitev poverjanje na isti napravi)."""
+    meta = app_load(args.name)
+    if not meta:
+        die(f"Aplikacija '{args.name}' ne obstaja. Uporabi: wineforge list")
+    prefix = prefix_path(meta.get("prefix") or args.name)
+    if not prefix.exists():
+        prefix = prepare_app_prefix(args.name)
+
+    if args.brez:
+        sspi_off(prefix)
+        log("SSPI vrnjen na Wineovega pravega (prekliči in zaženi program znova)")
+        return
+
+    if not args.test:
+        vklopljeno, stanje = sspi_state(prefix)
+        if vklopljeno and not args.reinstall:
+            log(f"SSPI: že vklopljeno — {stanje}")
+        else:
+            sspi_on(prefix, secret=args.secret)
+            log("SSPI: nadomestni modul vgrajen (NTLM, Negotiate, Kerberos, CredSSP, "
+                   "pku2u, wdigest, Tspkg)")
+            log("      Schannel/TLS in dpapi ostaneta Wineova prava.")
+        vklopljeno, stanje = sspi_state(prefix)
+        log(f"stanje: {stanje}")
+        if args.secret:
+            log("skupna skrivnost: nastavljena po meri (enaka mora biti v obeh prefixih)")
+        else:
+            log("skupna skrivnost: izpeljana iz imena računalnika (velja znotraj prefixa)")
+        return
+
+    vklopljeno, _ = sspi_state(prefix)
+    if not vklopljeno:
+        sspi_on(prefix, secret=args.secret)
+        log("SSPI: modul vgrajen za čas preizkusa")
+    log("preizkus pogajanj v prefixu ...")
+    koda, out = sspi_test(prefix, log_path=args.log)
+    for vrstica in (out or "").splitlines():
+        if re.search(r"paket|POSTAVLJENO|SE UJEMA|enaka|napaka|Schannel|stenska|KONEC|="
+                     r"|rezultat", vrstica, re.I):
+            log("  " + vrstica)
+    if koda == 0 and "POSTAVLJENO" in (out or "") and "SE UJEMA" in (out or ""):
+        log("RES: klient in storitev sta se pogovorila, ključ se ujema, šifrirano gre tja.")
+    else:
+        log("NI OK — preveri izpis zgoraj (lahko manjka kakšen uvožen modul).")
+
+
 # ---------------------------------------------- navidezni gamepad (uinput) ----
 # Windows igre ne berejo tipk iz X11, ampak XInput/DirectInput, ki pod Wineom
 # prideta iz jedrnih vhodnih naprav (/dev/input). Tu torej NE posnemamo gumba:
@@ -4219,6 +4347,7 @@ def cmd_gui(args):
                           "Namestuj igro s CD/DVD ali ISO slike",
                           "Dopolni predvajanje videa (igre z uvodnimi videi)",
                           "Program naj misli, da je skrbnik (pravice + storitve)",
+                          "Delujoca prijava med programi (NTLM/Negotiate)",
                           "Navidezni gamepad (igre brez ročke)",
                           "Navidezni zaslon (predvajanje brez monitorja)",
                           "Diagnoza (Wine, GPU, CUDA)",
@@ -4337,6 +4466,13 @@ def cmd_gui(args):
             code, out = _wf("sim", name,
                             progress_msg=f"Urejam pravice in storitve za {name} ...")
             _show("Pravice in storitve — " + name, out)
+        elif c.startswith("Delujoca prijava med programi"):
+            name = _app_menu("Prijava med klientom in storitvijo (NTLM/Negotiate)")
+            if not name:
+                continue
+            code, out = _wf("sspi", name, "--test",
+                            progress_msg=f"Vgrajam in preizkusim prijavo za {name} ...")
+            _show("Prijava med programi — " + name, out)
         elif c.startswith("Navidezni zaslon"):
             if disp_load():
                 _wf("display", "--remove", "vse")
@@ -4787,6 +4923,17 @@ def build_parser():
     s.add_argument("--pin", action="store_true",
                    help="utrdi identiteto stroja (MachineGuid, HwProfileGuid, InstallDate)")
     s.set_defaults(func=cmd_sim)
+
+    s = sub.add_parser("sspi", help="delujoč NTLM/Negotiate med klientom in storitvijo")
+    s.add_argument("name", help="ime nameščenega programa")
+    s.add_argument("--brez", action="store_true", help="vrni Wineov pravi secur32")
+    s.add_argument("--test", action="store_true", help="poženi preizkus pogajanj v prefixu")
+    s.add_argument("--reinstall", action="store_true", help="znova vgradi module (posodobitev)")
+    s.add_argument("--secret", metavar="GESLO",
+                   help="skupna skrivnost po meri (enaka v obeh prefixih, če sta dva)")
+    s.add_argument("--log", metavar="DATOTEKA",
+                   help="med preizkusom zapiši vsak SSPI klic v datoteko")
+    s.set_defaults(func=cmd_sspi)
 
     s = sub.add_parser("pad", help="navidezni Xbox gamepad za igre (uinput, brez roota)")
     s.add_argument("--start", action="store_true", help="ustvari napravo in zagni daemon")

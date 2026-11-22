@@ -82,6 +82,7 @@ odpre okno. Nič ročnega pisanja v terminal.
 | `sim` | skrbniške pravice + windows storitev + identiteta (`--verify`, `--win`, `--pin`) |
 | `pad` | navidezni Xbox gamepad za igre (`--start`, `--press`, `--axis`, `--dpad`, `--seq`) |
 | `display` | navidezni zaslon, ustreznik IddCx (`--add`, `--shot`, `--video`, `--move`, `--click`) |
+| `sspi` | delujoča NTLM/Negotiate prijava med klientom in storitvijo (`--test`, `--brez`, `--secret`) |
 | `deps` | iz PE uvozov ugotovi, katere komponente program potrebuje |
 | `bake` | zgradi/posodobi predlogo prefixa; `--compact` varčuje ~150 MB |
 | `prefix` | `list`, `new`, `delete`, `shell`, `explorer`, `tweaks` |
@@ -466,7 +467,31 @@ zrušitve. Tokrat smo ga ujeli na delu:
    sploh nista registrirana. To je tudi razlog, da `PsExec -s` prej ni mogel
    zapisati svojega ključa (`Neveljaven ročnik`).
 
-Poleg tega ostaja jedrni del (brez tega StarDesk na Windowsih ne deluje normalno):
+5. **SSPI vendarle ni bil pravi zapah (iste dne pozneje, z lastnim modulom).**
+   Ko smo napisali delujoč `secur32.dll` (spodaj) in ga vklopili, je klient umrl
+   **še prej** in v our dnevnik modula ni zapisal **nič** — do SSPI klica torej
+   sploh ne pride. Meritve nato razjasnijo sliko:
+
+   | poskus | izid |
+   |---|---|
+   | `wine 'C:\Program Files\StarDesk\bin\StarDesk.exe'` (iz druge mape) | koda **255**, ~230 ms |
+   | `cd ...\StarDesk\bin && wine StarDesk.exe` | koda **0**, ~150 ms |
+   | `--new-session --device-id ... --session-id ... --title ...` | koda **0**, ~150 ms |
+   | `__COMPAT_LAYER=Win10` / `Win10_1909` | koda **0**, ~150 ms (brez razlike) |
+   | `stardeskmgr.exe`, `StarDeskHealthd.exe` | ostaneta živa, a brez oken |
+
+   Klient torej v ~0,15 s sam odloči, da ne naredi ničesar, in to **ne** zaradi
+   Wineovega API-ja: Sentry zapis (`log/client/Sentry/*/session.json`) pokaže
+   `status: ok, errors: 0` (brez zrušitve), v kontekstu pa `kernel_version
+   6.1.7601` (Wine se predstavlja kot Windows 7 SP1) in `streamer_version V4.7.3`.
+   V programu obstaja sporočilo *»Host system not supported. We recommend
+   upgrading the host PC to Windows 10 or later.«* — kandidat za zgodnji izhod,
+   a maska verzije (`sim --win 11`, `__COMPAT_LAYER`) ga ne odpravi.
+   Ostane še preveriti, ali klient zahteva, da ga **zažene storitev** (žari ga
+   `StarDeskService` z lastnimi argumenti in žetonom `--local-host-token`), kar
+   bi pomenilo, da ga je pod Wineom mogoče dobiti le skozi storitev.
+
+Poleg tega jedrni del (brez tega StarDesk na Windowsih ne deluje normalno):
 `sdvhid.sys`, `ViGEmBus.sys`, `SDIddDriver` (IddCx), `SDUSB(.Mon).sys` — Wine nima
 jedra in jih ne more naložiti. Za dva od njiju ima WineForge že **nativna
 ustreznika**: `wineforge pad` (uinput namesto ViGEmBus/sdvhid) in
@@ -474,12 +499,9 @@ ustreznika**: `wineforge pad` (uinput namesto ViGEmBus/sdvhid) in
 
 Kaj bi še lahko poskusili (vrstni red po smislu):
 
-1. **Nadomestna SSPI knjižnica** — lasten `secur32.dll` kot proxy, ki za pakete
-   Negotiate/NTLM/Kerberos vrne samoskladno lažno lokalno avtentikacijo (storitev
-   in klient sta v istem prefixu, se torej vidita). Delno delo je veliko,
-   uspeh ni gotov; ta sistem poleg tega **nima prekriznega prevajalnika**
-   (`x86_64-w64-mingw32-gcc` / `clang` nista nameščena) — rabili bi prenosni
-   `llvm-mingw`.
+1. **Nadomestna SSPI knjižnica** — narejeno in deluje, glej poglavje
+   »SSPI, ki deluje« spodaj. Za StarDesk ni zadostovalo (klient do SSPI sploh ne
+   pride, glej meritev 5 zgoraj).
 2. **Pravi Windows v virtualnem racunalniku** — edina pot, ki res dobi jedro,
    gonilnike, UAC, SSPI in delujoč WebView2 hkrati. `/dev/kvm` je na voljo in
    procesor podpira VT-x; manjka še QEMU in Windows ISO.
@@ -490,6 +512,70 @@ Sonde, s katerima se to ponovi:
 wineforge sim <prefix> --verify          # pravice, storitve, identiteta
 wine 'C:\temp\sspi.exe'                   # scripts/probe-sspi.cs — kaj vrne SSPI
 wine 'C:\temp\wts.exe'                    # scripts/probe-wts.cs  — sej in WTS
+```
+
+## SSPI, ki deluje: `wineforge sspi` (NTLM / Negotiate / Kerberos)
+
+Wine 11 goni `AcquireCredentialsHandle` / `InitializeSecurityContext` prek
+LSA storitve (`lsasspirpc`), ki jo bi moral ponujati verižni uslužbenec; pod
+Wineom je odgovor prazen. Izmerjeno v prefixu StarDesk (`scripts/probe-sspi.cs`):
+
+| klic | Wine 11.22 | z `wineforge sspi` |
+|---|---|---|
+| `EnumerateSecurityPackagesW` | 5 paketov | **13** (naši 8 + Wineovih 5) |
+| `AcquireCredentialsHandle("NTLM")` | `S_OK` | `S_OK` |
+| `InitializeSecurityContext("NTLM", "localhost")` | `0x80090301` **SEC_E_INVALID_HANDLE** | **`SEC_I_CONTINUE_NEEDED` → `S_OK`** |
+| `AcceptSecurityContext` | iste napake | **`S_OK` (seja postavljena)** |
+| `QueryContextAttributes(PEER_TO_PEER_NAMES)` | / | `VIDO-CYBERDOG\vidov` |
+| `QueryContextAttributes(SESSION_KEY)` | / | 32 B, **na obeh straneh enak** |
+| `EncryptMessage` / `DecryptMessage` | / | **besedilo se vrne identicno** |
+| `AcquireCredentialsHandle("Schannel")` | `S_OK` | `S_OK` (posredovano Wineovemu modulu) |
+
+### Kaj je narejeno
+
+Izvir koda je `src/sspi/secur32_shim.c` (~1000 vrstic C, brez odvisnosti):
+
+- nadomestni `secur32.dll` z **38 lastnimi izvozi** in **47 posredovanimi**
+  (vse, kar zna Wineov `secur32`: `Lsa*`, `Sspi*`, `TranslateName*`, `Sasl*`,
+  `InitSecurityInterface*`, …), da noben uvoz ne manjka;
+- lasten pogajalni protokol (4 koraki: pogajanja → izziv → avtentikacija →
+  potrditev) z overjanjem **HMAC-SHA256** in **sejnim kljuem**, izpeljanim iz
+  obeh nonce-jev in skupne skrivnosti;
+- skupna skrivnost je po privzetem `SHA-256(ime racunalnika)`, torej je v enem
+  prefixu samoskladna; za dva prefixa jo nastavi z `--secret`;
+- `EncryptMessage`/`DecryptMessage`/`MakeSignature`/`VerifySignature` delujejo
+  s sejnim kljuem;
+- **Schannel (TLS) in `dpapi` ostaneta Wineova prava** — nadomestni modul ju
+  posreduje Wineovemu modulu, ki ga namesti kot `wine-secur32.dll`.
+
+### Uporaba
+
+```bash
+wineforge sspi stardesk              # vklopi (izvirnik se shrani kot secur32.original)
+wineforge sspi stardesk --test       # v prefixu poženi preizkus celotnih pogajanj
+wineforge sspi stardesk --brez       # vrni Wineovega pravega secur32
+wineforge sspi drug --secret "geslo" # enaka skrivnost v dveh prefixih
+wineforge sspi stardesk --test --log 'C:\temp\sspi.txt'   # dnevnik vsakega SSPI klica
+```
+
+GUI: *Delujoca prijava med programi (NTLM/Negotiate)* — vklopi in takoj preizkusi.
+
+Uporabi se, kadar program takoj umre brez okna ali sporočila: klient in storitev
+se avtentirata lokalno z `Negotiate`/`NTLM` (namenske mape, oddaljeno namizje,
+nekateri zaganjalniki, `.NET ServiceController` z overjanjem). Wine pri tem
+vrne `SEC_E_INVALID_HANDLE`, programi pa to pogosto raje molčijo, kot da javijo
+napako — ostane samo izhodna koda 255 ali 0 in tiho.
+
+### Ponovna gradnja modulov
+
+Modula v `share/sspi/` sta zgrajena in ne zahtevata prevajalnika. Ce ju zeliš
+predelati:
+
+```bash
+mkdir -p engine/tools/llvm-mingw && cd engine/tools
+# prenosni prevajalnik (ni ga v distribuciji, ne raba roota):
+#   llvm-mingw-<datum>-ucrt-ubuntu-22.04-x86_64.tar.xz -> razširi v llvm-mingw/
+bash src/sspi/build.sh        # zgradi x64 + x86 in preizkus, namesti v share/sspi/
 ```
 
 ## Navidezni zaslon (`display`) — ustreznik `SDIddDriver` / IddCx
