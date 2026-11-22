@@ -3591,7 +3591,7 @@ def cmd_pad(args):
                                  cwd=str(FORGE))
             for _ in range(20):
                 time.sleep(0.5)
-                if pad_kernel() and pad_pids():
+                if pad_kernel() and pad_pids() and PAD_SOCK.exists():
                     break
         roko = pad_kernel()
         if roko:
