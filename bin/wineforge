@@ -12,6 +12,7 @@ zato motor deluje iz katerekoli lokacije, tudi z USB ključa.
 """
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -85,6 +86,7 @@ WINEBOOT = WINE_DIR / "bin" / "wineboot"
 WINE64 = WINE_DIR / "bin" / "wine64"
 NVLIBS = ENGINE / "nvidia-libs"
 TOOLS = ENGINE / "tools"
+GST_BUNDLED = TOOLS / "gstreamer"     # prenosni GStreamer plugini (brez roota)
 TOOLSBIN = TOOLS / "bin"   # prenosli orodji (cabextract) — ni odvisno od sistema
 SHARE = FORGE / "share"
 TEMPLATES = SHARE / "templates"
@@ -194,6 +196,22 @@ def wine_env(prefix=None, extra=None, debug=False):
         env["DXVK_STATE_CACHE_PATH"] = str(p / "dxvk-cache")
         (p / "dxvk-cache").mkdir(parents=True, exist_ok=True)
     env["WINEARCH"] = "win64"
+    # DXVK-NVAPI Reflex sloj (nizek zakasnitveni odziv v igrah z NVIDIA)
+    if NVAPI_LAYER.is_dir() and os.environ.get("WINEFORGE_NO_REFLEX") != "1":
+        cur = os.environ.get("VK_ADD_LAYER_PATH", "")
+        env["VK_ADD_LAYER_PATH"] = (f"{NVAPI_LAYER}:{cur}" if cur else str(NVAPI_LAYER))
+        env["DXVK_NVAPI_VKREFLEX"] = "1"
+    # vgrajeni GStreamer plugini (qtdemux/matroska ...) — brez njih pade
+    # predvajanje videa (Media Foundation) v igrah
+    if GST_BUNDLED.is_dir():
+        cur = os.environ.get("GST_PLUGIN_PATH", "")
+        env["GST_PLUGIN_PATH"] = (f"{GST_BUNDLED}:{cur}" if cur else str(GST_BUNDLED))
+    # samodejno poveži CD/DVD in naložene ISO slike v prefix
+    if prefix:
+        try:
+            link_discs(p)
+        except OSError:
+            pass
     if debug:
         env["WINEDEBUG"] = "+loaddll,+module"
     if extra:
@@ -353,6 +371,8 @@ def setup_defaults(prefix, quiet=False):
     apply_overrides(prefix)
     if link_nvidia_libs(prefix):
         log("    NVIDIA knjižnice (nvcuda/nvml/nvapi) vpete")
+    if Path(prefix).name != "_doctor":
+        ensure_nvapi(prefix, quiet=quiet)
     # Windows različica 10 (večina sodobnih programov zahteva; winecfg posodobi
     # tudi HKLM\...\CurrentVersion, kar nekateri installerji preverjajo)
     reg_add(prefix, r"HKEY_CURRENT_USER\Software\Wine", "Version", "win10")
@@ -696,6 +716,544 @@ def scan_deps(target):
     return found, archs
 
 
+# ------------------------------------------------- predvajanje videa (MF) ---
+# Winejev Media Foundation (uvodni videi, predvajalniki v igrah in programih)
+# dela prek sistemskega GStreamerja. Če manjka demuxer ali dekoder, igra pade z
+# "Failed to create SourceReader with registered byte stream handler (0x80004005)".
+
+GST_ELEMENTS = [
+    ("typefindfunctions", "prepoznavanje vrste datoteke"),
+    ("decodebin3",        "samodejna vzpostavitev verige"),
+    ("qtdemux",           "MP4/MOV — najpogostejši video v igrah"),
+    ("matroskademux",     "MKV/WebM"),
+    ("avdec_h264",        "H.264 dekodiranje (FFmpeg)"),
+    ("avdec_h265",        "HEVC/H.265 dekodiranje (FFmpeg)"),
+]
+
+# paketi, ki te elemente vsebujejo (Arch imena)
+GST_PACKAGES = ["gst-plugins-good", "gst-plugins-base", "gst-plugins-bad", "gst-libav"]
+
+
+def gst_bin():
+    return shutil.which("gst-inspect-1.0")
+
+
+def gst_env():
+    e = dict(os.environ)
+    if GST_BUNDLED.is_dir():
+        cur = e.get("GST_PLUGIN_PATH", "")
+        e["GST_PLUGIN_PATH"] = (f"{GST_BUNDLED}:{cur}" if cur else str(GST_BUNDLED))
+    return e
+
+
+def gst_has(element):
+    """True/False ali None (če GStreamer sploh ni nameščen)."""
+    g = gst_bin()
+    if not g:
+        return None
+    code, _ = run([g, element], env=gst_env(), capture=True)
+    return code == 0
+
+
+def gst_version():
+    g = gst_bin()
+    if not g:
+        return ""
+    code, out = run([g, "--version"], capture=True)
+    m = re.search(r"(?i)version\s+(\d+\.\d+(?:\.\d+)?)", out or "")
+    if not m:
+        m = re.search(r"\d+\.\d+\.\d+", out or "")
+    return m.group(1) if m else ""
+
+
+def media_missing():
+    """(seznam manjkajočih elementov, razlog) — razlog '' pomeni 'gre popraviti'."""
+    if not gst_bin():
+        return [(n, d) for n, d in GST_ELEMENTS], "GStreamer (gst-inspect-1.0) ni nameščen"
+    return [(n, d) for n, d in GST_ELEMENTS if not gst_has(n)], ""
+
+
+def _so_loads(path):
+    """Naloži .so, da vidimo, ali so vse odvisnosti na voljo."""
+    try:
+        ctypes.CDLL(str(path))
+        return True
+    except OSError:
+        return False
+
+
+def _is_arch():
+    try:
+        t = Path("/etc/os-release").read_text(errors="ignore").lower()
+    except OSError:
+        return False
+    return any(i in t for i in ("endeavouros", "arch", "manjaro", "garuda", "cachyos"))
+
+
+def _arch_pkg(name):
+    """(url, pkgver) za x86_64 paket na Archem ali (None, None)."""
+    code, out = run(["curl", "-sL", "--fail", "--retry", "2",
+                     f"https://archlinux.org/packages/search/json/?name={name}"],
+                    capture=True)
+    if code:
+        return None, None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None, None
+    for r in data.get("results", []):
+        if r.get("pkgname") != name or r.get("arch") not in ("x86_64", "any"):
+            continue
+        fn = r.get("filename")
+        if not fn:
+            continue
+        return (f"https://geo.mirror.pkgbuild.com/{r.get('repo', 'extra')}/os/x86_64/{fn}",
+                r.get("pkgver", ""))
+    return None, None
+
+
+def media_hint():
+    return ("Namesti manjkajoče-pluginske pakete:\n"
+            "  Arch/EndeavourOS: sudo pacman -S gst-plugins-good gst-plugins-base "
+            "gst-plugins-bad gst-libav\n"
+            "  Debian/Ubuntu:    sudo apt install gstreamer1.0-plugins-good "
+            "gstreamer1.0-plugins-bad gstreamer1.0-libav\n"
+            "  Fedora:           sudo dnf install gstreamer1.0-plugins-good "
+            "gstreamer1.0-plugins-bad gstreamer1.0-libav")
+
+
+def media_fix():
+    """Dopolni manjkajoče GStreamer pluginje brez roota (engine/tools/gstreamer)."""
+    missing, why = media_missing()
+    if not missing:
+        log("Predvajanje videa je že popolno — ni kaj popravljati.")
+        return True
+    if why:
+        warn(why + " — samodejni prenos na tej poti ni mogoč.")
+        log(media_hint())
+        return False
+    if not _is_arch():
+        warn("Samodejni prenos pluginov je pripravljen za Arch/EndeavourOS.")
+        log(media_hint())
+        return False
+    gv = gst_version()
+    step(f"Dopolnjujem predvajanje videa (GStreamer {gv or '?'})")
+    tmp = Path(tempfile.mkdtemp(prefix="wfgst-"))
+    got = 0
+    try:
+        for pkg in GST_PACKAGES:
+            url, pver = _arch_pkg(pkg)
+            if not url:
+                warn(f"  {pkg}: paketa ni najti")
+                continue
+            if gv and pver and pver != gv:
+                warn(f"  {pkg}: {pver} se ne ujema s sistemskim {gv} (ABI) — preskočem")
+                continue
+            try:
+                arc = download(url, DEPS / Path(url).name)
+            except RuntimeError as exc:
+                warn(f"  {pkg}: {exc}")
+                continue
+            code, out = run(["tar", "--zstd", "-xf", str(arc), "-C", str(tmp)],
+                            capture=True)
+            src = tmp / "usr" / "lib" / "gstreamer-1.0"
+            if code or not src.is_dir():
+                warn(f"  {pkg}: razpakiranje ni uspelo")
+                continue
+            GST_BUNDLED.mkdir(parents=True, exist_ok=True)
+            n = 0
+            for so in sorted(src.glob("*.so")):
+                if _so_loads(so):
+                    shutil.copy2(so, GST_BUNDLED / so.name)
+                    n += 1
+            log(f"  {pkg}: {n} uporabnih pluginov")
+            got += n
+            if not media_missing()[0]:
+                break   # vse potrebno je ze na voljo
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    still, _ = media_missing()
+    if still:
+        warn(f"Še vedno manjka: {', '.join(n for n, _ in still)}")
+        log(media_hint())
+        return got > 0
+    log("Predvajanje videa je zdaj popolno (vgrajeno v engine/tools/gstreamer).")
+    return True
+
+
+def cmd_media(args):
+    step("Predvajanje videa v Wine (Media Foundation)")
+    if not gst_bin():
+        warn("GStreamer ni nameščen — Wine ne more predvajati videa.")
+        log(media_hint())
+        return 1 if args.fix and not media_fix() else 1
+    for el, desc in GST_ELEMENTS:
+        ok = gst_has(el)
+        mark = "\033[1;32m✓\033[0m" if ok else ("?" if ok is None else "\033[1;31m✗\033[0m")
+        print(f" {mark} {el:<18} {desc}")
+    if GST_BUNDLED.is_dir():
+        n = len(list(GST_BUNDLED.glob("*.so")))
+        log(f"  vgrajeni plugini: {GST_BUNDLED} ({n} kosov)")
+    missing, _ = media_missing()
+    if not missing:
+        log("\nVse potrebne komponente so na voljo — uvodni videi in predvajalniki")
+        log("v igrah bodo delovali.")
+        return 0
+    log(f"\nManjka: {', '.join(n for n, _ in missing)}")
+    log("Posledica v igrah: okno \"Failed to create SourceReader with registered")
+    log(" byte stream handler\" in taksnen izhod igre.")
+    if args.fix:
+        return 0 if media_fix() else 1
+    log("\nPopravek brez roota:  wineforge media --fix")
+    return 1
+
+
+# --------------------------------------------------- DXVK-NVAPI (DLSS/RT) ---
+# Za novejse igre (DLSS, DLSS Frame Generation, Reflex, sledenje žarkov) Wine
+# potrebuje DXVK-NVAPI — NVIDIA-jev windowski nvapi64.dll pod Wine ne dela
+# ( govori z windowskim gonilnikom). Proton/Bottles ga vgradijo privzeto, tukaj
+# ga dodamo sami (enkratni prenos ~6 MB, potem iz predpomnilnika).
+
+NVAPI_REPO = ("jp7677", "dxvk-nvapi")
+NVAPI_CACHE = DATA / "nvapi"
+NVAPI_LAYER = NVAPI_CACHE / "layer"
+
+
+def nvapi_variant(prefix):
+    """'dxvk-nvapi', 'nvidia' ali 'ni' — kateri nvapi64.dll je v prefixu."""
+    f = Path(prefix) / "drive_c" / "windows" / "system32" / "nvapi64.dll"
+    if not f.exists():
+        return "ni"
+    try:
+        data = f.read_bytes()
+    except OSError:
+        return "?"
+    if b"DXVK_NVAPI" in data or b"DXVK-NVAPI" in data:
+        return "dxvk-nvapi"
+    return "nvidia"
+
+
+def _nvapi_latest():
+    """Verzija zadnje izdaje DXVK-NVAPI (ali None, ce ni povezave)."""
+    code, out = run(["curl", "-sL", "--fail", "--retry", "2",
+                     f"https://api.github.com/repos/{NVAPI_REPO[0]}/{NVAPI_REPO[1]}"
+                     "/releases/latest"], capture=True)
+    if code:
+        return None
+    try:
+        return (json.loads(out).get("tag_name") or "").lstrip("v") or None
+    except ValueError:
+        return None
+
+
+def _nvapi_cache(ver):
+    """Razpakira DXVK-NVAPI v predpomnilnik; vrne mapo z dll-ji ali None."""
+    d = NVAPI_CACHE / ver
+    if (d / "nvapi64.dll").exists():
+        return d
+    url = (f"https://github.com/{NVAPI_REPO[0]}/{NVAPI_REPO[1]}/releases/download/"
+           f"v{ver}/dxvk-nvapi-v{ver}.tar.gz")
+    try:
+        arc = download(url, DEPS / f"dxvk-nvapi-v{ver}.tar.gz")
+    except RuntimeError:
+        return None
+    tmp = Path(tempfile.mkdtemp(prefix="wfnvapi-"))
+    try:
+        code, _ = run(["tar", "xzf", str(arc), "-C", str(tmp)], capture=True)
+        if code:
+            return None
+        d.mkdir(parents=True, exist_ok=True)
+        for dll in tmp.rglob("*.dll"):
+            if dll.parent.name in ("x64", "x32"):
+                shutil.copy2(dll, d / dll.name)
+        for exe in tmp.rglob("dxvk-nvapi*.exe"):
+            if "tests" not in exe.name:
+                shutil.copy2(exe, d / exe.name)
+        lay = tmp / "layer"
+        if lay.is_dir():
+            NVAPI_LAYER.mkdir(parents=True, exist_ok=True)
+            for f in lay.iterdir():
+                shutil.copy2(f, NVAPI_LAYER / f.name)
+        return d if (d / "nvapi64.dll").exists() else None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def ensure_nvapi(prefix, quiet=False):
+    """V prefix vgradi DXVK-NVAPI (DLSS, Reflex, RT) — enako kot Proton."""
+    p = Path(prefix)
+    if not (p / "drive_c" / "windows" / "system32").is_dir():
+        return False
+    if nvapi_variant(p) == "dxvk-nvapi":
+        return True
+    ver = _nvapi_latest()
+    if not ver:
+        if not quiet:
+            warn("DXVK-NVAPI: GitHub ni dosegljiv — izpustim (DLSS morda ne dela)")
+        return False
+    d = _nvapi_cache(ver)
+    if not d:
+        if not quiet:
+            warn("DXVK-NVAPI: prenosa/razpakiranja ni uspelo — izpustim")
+        return False
+    cilji = (("system32", "nvapi64.dll"), ("syswow64", "nvapi.dll"),
+               ("system32", "nvofapi64.dll"))
+    for folder, name in cilji:
+        src = d / name
+        if not src.exists():
+            continue
+        dst = p / "drive_c" / "windows" / folder / name
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.is_symlink() or dst.exists():
+                dst.unlink()
+            shutil.copy2(src, dst)
+        except OSError:
+            return False
+    orodje = d / "dxvk-nvapi.exe"
+    if orodje.exists():
+        try:
+            shutil.copy2(orodje, p / "drive_c" / "windows" / "system32" / "dxvk-nvapi.exe")
+        except OSError:
+            pass
+    reg_add(p, r"HKEY_CURRENT_USER\Software\Wine\DllOverrides", "nvapi64", "native")
+    reg_add(p, r"HKEY_CURRENT_USER\Software\Wine\DllOverrides", "nvapi", "native")
+    if not quiet:
+        log(f"    DXVK-NVAPI {ver} vpet (DLSS / Reflex / sledenje zarkov)")
+    return True
+
+
+# ------------------------------------------------------------------ diski ----
+# Podpora za igre/programme na CD/DVD (pravi pogon ali ISO slika). Vse brez
+# roota: udisks2 poskrbi za zanko in montažo, Wine dobi pogon v dosdevices/.
+
+DISC_FSTYPES = ("iso9660", "udf", "cd9660")
+DISC_LETTERS = "DEFGHIJKLMNOPQRSTUVWXYZ"
+DISC_INSTALLERS = ("setup.exe", "setup64.exe", "setup_x64.exe", "setup_x86_64.exe",
+                   "install.exe", "install64.exe", "installer.exe", "install.bat",
+                   "start.exe", "launch.exe", "launchpad.exe", "setup.msi",
+                   "install.msi", "installer.msi")
+
+
+def optical_devices():
+    return sorted(str(p) for p in Path("/dev").glob("sr[0-9]*"))
+
+
+def _mounts():
+    try:
+        rows = []
+        for line in Path("/proc/mounts").read_text(errors="ignore").splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                rows.append((parts[0], parts[1], parts[2]))
+        return rows
+    except OSError:
+        return []
+
+
+def find_installer(root, max_entries=8000):
+    """Zagonski programi na disku (autorun.inf, setup.exe, install.msi ...)."""
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    hits = []
+    autorun = next((f for f in root.iterdir()
+                    if f.is_file() and f.name.lower() == "autorun.inf"), None)
+    if autorun:
+        try:
+            txt = autorun.read_text(errors="ignore")
+        except OSError:
+            txt = ""
+        for m in re.finditer(r"(?im)^\s*(?:open|action|shell[\w. ]*command)\s*=\s*(.+)$", txt):
+            rel = m.group(1).strip().strip('"').replace("\\", "/").lstrip("/\\")
+            cand = root / rel
+            if rel and cand.is_file():
+                hits.append((0, cand))
+    names = []
+    for i, f in enumerate(root.rglob("*")):
+        if i > max_entries:
+            break
+        if f.suffix.lower() not in (".exe", ".msi") or not f.is_file():
+            continue
+        n = f.name.lower()
+        if n in DISC_INSTALLERS:
+            names.append((1, f))
+        elif "setup" in n or "install" in n:
+            names.append((2, f))
+    hits += names
+    hits.sort(key=lambda t: (t[0], str(t[1])))
+    out, seen = [], set()
+    for _rank, f in hits:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def disc_scan():
+    """Vidni diski: pravi opticni pogoni + montirane ISO slike."""
+    rows, out = _mounts(), []
+    for dev in optical_devices():
+        mp = next((m[1] for m in rows if m[0] == dev), None)
+        out.append({"dev": dev, "kind": "CD/DVD pogon", "mount": mp,
+                    "path": mp or dev, "ready": bool(mp)})
+    for dev, mnt, fst in rows:
+        if fst not in DISC_FSTYPES:
+            continue
+        if any(d["dev"] == dev for d in out):
+            continue
+        out.append({"dev": dev, "kind": "disk (ISO/slika)", "mount": mnt,
+                    "path": mnt, "ready": True})
+    return out
+
+
+def disc_link(prefix, target, letter=None):
+    """Poveži mapo ali napravo v prefix kot pogon; vrne črko pogona."""
+    dd = Path(prefix) / "dosdevices"
+    if not dd.is_dir():
+        return None
+    used = {p.name[0].upper() for p in dd.iterdir()
+            if len(p.name) == 2 and p.name[1] == ":" and p.name[0].isalpha()}
+    if not letter:
+        letter = next((c for c in DISC_LETTERS if c not in used), None)
+    if not letter:
+        return None
+    link = dd / (letter.lower() + ":")
+    try:
+        if link.is_symlink() or link.exists():
+            if link.is_symlink() and os.path.realpath(link) == os.path.realpath(str(target)):
+                return letter
+            link.unlink()
+        link.symlink_to(str(target))
+    except OSError:
+        return None
+    return letter
+
+
+def link_discs(prefix, quiet=True):
+    """Poveži vse vidne diske v prefix (ce ze niso)."""
+    dd = Path(prefix) / "dosdevices"
+    if not dd.is_dir():
+        return []
+    targets = []
+    for m in _mounts():
+        if m[2] in DISC_FSTYPES and Path(m[1]).is_dir():
+            targets.append(m[1])
+    for dev in optical_devices():
+        mp = next((m[1] for m in _mounts() if m[0] == dev), None)
+        targets.append(mp or dev)
+    have = set()
+    for p in dd.iterdir():
+        if len(p.name) == 2 and p.name[1] == ":" and p.is_symlink():
+            have.add(os.path.realpath(str(p)))
+    linked = []
+    for t in targets:
+        if os.path.realpath(str(t)) in have:
+            continue
+        letter = disc_link(prefix, t)
+        if letter:
+            linked.append((letter, t))
+            have.add(os.path.realpath(str(t)))
+    if linked and not quiet:
+        for letter, t in linked:
+            log(f"  disk povezan kot {letter}:  <- {t}")
+    return linked
+
+
+def disc_mount_iso(iso):
+    """Naloži ISO sliko (zanka + montaža) brez roota; vrne (naprava, priključna točka)."""
+    if not shutil.which("udisksctl"):
+        die("Potreben je udisksctl (paket udisks2).")
+    iso = Path(iso).expanduser().resolve()
+    if not iso.exists():
+        die(f"Ne obstaja: {iso}")
+    step(f"Nalagam ISO: {iso.name}")
+    code, out = run(["udisksctl", "loop-setup", "-f", str(iso)], capture=True)
+    m = re.search(r"as (\S+)", out)
+    if code or not m:
+        die(f"loop-setup ni uspel:\n{out}")
+    dev = m.group(1)
+    code, out = run(["udisksctl", "mount", "-b", dev], capture=True)
+    m2 = re.search(r"at (\S+)", out)
+    if code or not m2:
+        die(f"Montiranje ni uspelo:\n{out}")
+    mp = m2.group(1)
+    log(f"  {dev} → {mp}")
+    return dev, mp
+
+
+def disc_release(dev):
+    code, out = run(["udisksctl", "unmount", "-b", dev], capture=True)
+    log(f"  {dev}: " + ("odmontiran" if code == 0 else out.strip() or "že odmontiran"))
+    if dev.startswith("/dev/loop"):
+        code, out = run(["udisksctl", "loop-delete", "-b", dev], capture=True)
+        log(f"  {dev}: " + ("zanka sproščena" if code == 0 else out.strip()))
+    return 0
+
+
+def cmd_disc(args):
+    if args.eject:
+        step("Odpenjam diske")
+        for d in disc_scan():
+            disc_release(d["dev"])
+        return 0
+    if args.iso:
+        disc_mount_iso(args.iso)
+    discs = disc_scan()
+    if not discs:
+        log("Ni nobenega diska.")
+        log("  pravi disk:  vstavi CD/DVD (ali priklopi USB pogon) in ponovi")
+        log("  ISO slika:   wineforge disc --iso pot/do/igre.iso")
+        log("  namestitev:  wineforge disc --install --name igra")
+        return 1
+    found_installer = None
+    for d in discs:
+        log(f"\n{d['kind']}: {d['dev']}" +
+            (f"  →  {d['mount']}" if d["mount"] else "  (naprava, brez montaze)"))
+        path = Path(d["path"])
+        if not d["ready"] or not path.is_dir():
+            log("  ni medija ali pa mapa ni dostopna")
+            continue
+        total = sum(1 for _ in path.rglob("*"))
+        log(f"  datotek: {total}")
+        inst = find_installer(path)
+        if inst:
+            log("  namestitveni programi:")
+            for f in inst[:8]:
+                try:
+                    log(f"    {f.relative_to(path)}")
+                except ValueError:
+                    log(f"    {f}")
+            found_installer = found_installer or inst[0]
+        else:
+            log("  ni prepoznanega installerja (setup.exe / install.msi / autorun.inf)")
+    if args.link:
+        p = prefix_path(args.link)
+        if not (p / "system.reg").exists():
+            die(f"Prefix ne obstaja: {p}")
+        linked = link_discs(p, quiet=False)
+        if not linked:
+            log("  ni kaj povezati (ali so diski že povezani)")
+        return 0
+    if args.install is not None:
+        target = Path(args.install).expanduser() if args.install else found_installer
+        if not target:
+            die("Na disku ni nobenega namestitvenega programa.")
+        if not Path(target).exists():
+            die(f"Ne obstaja: {target}")
+        if not Path(target).is_absolute():
+            die("Pot do programa na disku naj bo absolutna (glej seznam zgoraj).")
+        ensure_ready()
+        name = args.name or re.sub(r"(?i)(setup|install|installer|x64|x86)", "",
+                                   Path(target).stem).strip(" .-") or "disc-app"
+        log(f"\nNameščam {Path(target).name} kot '{name}' ...")
+        return cmd_install(argparse.Namespace(
+            installer=str(target), name=name, exe=args.exe, interactive=False,
+            args=[], keep_staging=False, no_shortcut=False))
+    log("\nNaslednji korak:  wineforge disc --install --ime <ime-programa>")
+    return 0
+
+
 # ---------------------------------------------------------------- doctor ----
 
 # ------------------------------------------------------------- peka --------
@@ -734,6 +1292,7 @@ BAKE_STEPS = [
     ("dotnetdesktop8", "opt", ("winetricks", "dotnetdesktop8"), ".NET Desktop Runtime 8"),
     ("dotnet48", "opt", ("winetricks", "dotnet48"), ".NET Framework 4.8"),
     ("nvidia", "nvidia", None, "NVIDIA CUDA/NVML/NVAPI (nvidia-libs)"),
+    ("nvapi", "nvapi", None, "DXVK-NVAPI (DLSS, Reflex, sledenje zarkov)"),
     ("overrides", "overrides", None, "DLL override-i (DXVK/VKD3D/CUDA)"),
 ]
 
@@ -857,6 +1416,9 @@ def cmd_bake(args):
             reg_add(prefix, key, var, v)
         elif kind == "nvidia":
             link_nvidia_libs(prefix)
+        elif kind == "nvapi":
+            if not ensure_nvapi(prefix):
+                warn("  DXVK-NVAPI ni namescen (ni povezave?) — DLSS morda ne dela")
         elif kind == "overrides":
             apply_overrides(prefix)
         st["done"].append(nm)
@@ -1465,6 +2027,8 @@ def _doctor_fix():
     step("doctor --fix — popravljam")
     if setup_missing():
         cmd_setup(_ns_setup())
+    if media_missing()[0]:
+        media_fix()
     for name in list_prefixes():
         p = prefix_path(name)
         if not (p / "system.reg").exists():
@@ -1548,6 +2112,37 @@ def cmd_doctor(args):
                     dev = l.strip()
                     break
             line("CUDA v Wine", (dev or ("ok" if has else "ne dela")), has)
+    # NVAPI (DLSS / Reflex / sledenje zarkov) — pogledamo obstojece prefixe
+    var = {}
+    for nm in list_prefixes():
+        if nm.startswith("_"):
+            continue
+        var.setdefault(nvapi_variant(prefix_path(nm)), []).append(nm)
+    if not var:
+        line("NVAPI (DLSS/RT)", "ni prefixov (vgradi se sam ob ustvarjanju)", None)
+    else:
+        slabi = [n for k, ns in var.items() if k != "dxvk-nvapi" for n in ns]
+        line("NVAPI (DLSS/RT)",
+             "DXVK-NVAPI v vseh prefixih" if not slabi else
+             f"{', '.join(slabi)}: Windows nvapi → wineforge doctor --fix",
+             not slabi)
+    # predvajanje videa (Media Foundation prek GStreamerja)
+    miss, why = media_missing()
+    if why:
+        line("predvajanje videa", why, None)
+    else:
+        line("predvajanje videa",
+             "v redu" if not miss else
+             "manjka: " + ", ".join(n for n, _ in miss) + " → wineforge media --fix",
+             not miss)
+    # diski
+    devs = optical_devices()
+    loops = [m for m in _mounts() if m[2] in DISC_FSTYPES]
+    line("optični pogon",
+         f"{len(devs)} naprav" if devs else "ni naprave (ISO: wineforge disc --iso)",
+         None)
+    if loops:
+        line("montirani diski", ", ".join(m[1] for m in loops), None)
     log()
     if not getattr(args, "keep_prefix", False):
         _doctor_cleanup()
@@ -2383,6 +2978,8 @@ def cmd_gui(args):
                           "Naredi prenosni paket (USB)",
                           "Odpri mapo programov",
                           "Odpri dnevnike (napake pri namestitvi)",
+                          "Namestuj igro s CD/DVD ali ISO slike",
+                          "Dopolni predvajanje videa (igre z uvodnimi videi)",
                           "Diagnoza (Wine, GPU, CUDA)",
                           "Zapri")
         if code != 0 or not choice.strip():
@@ -2464,6 +3061,38 @@ def cmd_gui(args):
         elif c.startswith("Diagnoza"):
             code, out = _wf("doctor", progress_msg="Preverjam motor, GPU in CUDA ...")
             _show("Diagnoza", out)
+        elif c.startswith("Namestuj igro s CD"):
+            code, choice = zt("--list", "--title=Disk CD/DVD ali ISO", "--hide-header",
+                              "--width=460", "--text=<b>Kje je igra?</b>",
+                              "--column=Vir",
+                              "Izberi ISO sliko (.iso)",
+                              "Uporabi vstavljen disk (CD/DVD pogon)")
+            if code != 0:
+                continue
+            disc_out = ""
+            if choice.strip().startswith("Izberi ISO"):
+                iso = _pick_file("Izberi ISO sliko igre", "*.iso *.ISO *.img *.mdf")
+                if not iso:
+                    continue
+                code, disc_out = _wf("disc", "--iso", iso,
+                                     progress_msg="Nalagam ISO sliko ...")
+            else:
+                code, disc_out = _wf("disc", progress_msg="Prepoznavam disk ...")
+            _show("Disk", disc_out)
+            if "namestitveni programi" not in disc_out:
+                continue
+            name = _ask("Ime igre", "Kako naj jo pišem v seznam?", "igra")
+            if not name:
+                continue
+            code, out = _wf("disc", "--install", "--name", name,
+                            progress_msg="Nameščam igro s diska ...\n"
+                                         "Lahko traja nekaj minut.")
+            m = re.search(r"dnevnik namestitve: (\S+)", out)
+            _show("Namestitev z diska", out, log=m.group(1) if m else None)
+        elif c.startswith("Dopolni predvajanje"):
+            code, out = _wf("media", "--fix",
+                            progress_msg="Dopolnjujem predvajanje videa ...")
+            _show("Predvajanje videa", out)
         else:
             return 0
 
@@ -2856,6 +3485,21 @@ def build_parser():
     s.add_argument("--install", action="store_true")
     s.set_defaults(func=cmd_deps)
 
+    s = sub.add_parser("media", help="predvajanje videa v igrah (preveri, dopolni)")
+    s.add_argument("--fix", action="store_true",
+                   help="dopolni manjkajoče GStreamer pluginje (brez roota)")
+    s.set_defaults(func=cmd_media)
+
+    s = sub.add_parser("disc", help="igre in programi s CD/DVD ali ISO slike")
+    s.add_argument("--iso", help="naloži ISO sliko (npr. igra.iso)")
+    s.add_argument("--install", nargs="?", const="", default=None, metavar="EXE",
+                   help="namesti program z diska (brez EXE: prvi najdeni)")
+    s.add_argument("--name", "--ime", dest="name", help="ime nove aplikacije")
+    s.add_argument("--exe", help="glavni exe po namestitvi")
+    s.add_argument("--link", metavar="PREFIX", help="poveži diske v prefix kot pogone")
+    s.add_argument("--eject", action="store_true", help="odmontiraj in sprosti diske")
+    s.set_defaults(func=cmd_disc)
+
     return p
 
 
@@ -2869,7 +3513,7 @@ def main(argv=None):
         return 0
     # prvi zagon na novem računalniku: motor se pripravi sam (razen pri
     # gui/setup/doctor/tray/update — ti to zmorejo sami oz. so namerni):
-    if args.cmd not in ("doctor", "setup", "gui", "config", "tray", "update") \
+    if args.cmd not in ("doctor", "setup", "gui", "config", "tray", "update", "media") \
             and setup_missing():
         ensure_ready()
     return args.func(args) or 0

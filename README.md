@@ -77,6 +77,8 @@ odpre okno. Nič ročnega pisanja v terminal.
 | `scale` | ročno nastavi velikost vmesnika: `scale <app> 150` (100 = normalno) |
 | `config` | globalne nastavitve, npr. privzeto samodejno skaliranje |
 | `install` | zažene installer in iz njega naredi prenosno aplikacijo (`--no-shortcut`) |
+| `disc` | igre s CD/DVD ali ISO: `--iso`, `--install`, `--link`, `--eject` |
+| `media` | preveri/dopolni predvajanje videa v igrah (`--fix`, brez roota) |
 | `deps` | iz PE uvozov ugotovi, katere komponente program potrebuje |
 | `bake` | zgradi/posodobi predlogo prefixa; `--compact` varčuje ~150 MB |
 | `prefix` | `list`, `new`, `delete`, `shell`, `explorer`, `tweaks` |
@@ -94,10 +96,132 @@ odpre okno. Nič ročnega pisanja v terminal.
 * **VC++ 2005–2022, VB6, .NET Framework 4.8, .NET Desktop 8, WebView2,
   DirectX helperji (d3dx9/d3dx11/d3dcompiler), MSXML, RichEdit, XACT, pisave** —
   v predlogi prefixa, zato je prvi zagon hiter.
+* **DXVK-NVAPI** (samodejno ob ustvarjanju prefixa): `nvapi64.dll`, ki ga igre
+  rabijo za **DLSS, DLSS Frame Generation, Reflex in sledenje žarkov** —
+  Windowski `nvapi64.dll` pod Wine ne more delati (govori z windowskim
+  gonilnikom). Dodan je tudi Vulkan `reflex` sloj (`VK_ADD_LAYER_PATH`);
+  izklop: `WINEFORGE_NO_REFLEX=1`.
+* **Podpora za diske** (`disc`): pravi CD/DVD pogon ali ISO slika — Wine dobi
+  pogon tipa **CDROM** (preverjeno), brez roota in brez ročnega montiranja.
+* **Predvajanje videa** (`media`): UVODNI videi in vgrajeni predvajalniki
+  potrebujejo GStreamer demuxerje/dekoderje; manjkajoče motor sam pripelje v
+  `engine/tools/gstreamer` (glej *Igre in diski*).
 * **winetricks + offline predpomnilnik** (`share/verbs`): dodatne komponente
   delujejo tudi brez interneta.
 * Vsaka aplikacija ima **svoj prefix** (kot na Windows), zato si programi ne
   uničijo registra/DLL-jev.
+
+## Igre in diski
+
+### Vse teče lokalno — to ni streaming
+Ko zaženeš igro, se nič ne predvaja iz interneta. Datoteke igre so na tvojem
+disku, procesor in grafična kartica pa delata v tvojem računalniku.
+Wine/Proton je samo **prevajalec**: Windows klice (Direct3D, XInput, registry, datotečni sistem)
+pretvori v Linux ekvivalente (Vulkan, evdev, wine prefix). Povezava je
+potrebna samo za to, kar potrebuje povezavo tudi na Windowsih: prijava v
+Epic/Steam, spletna trgovina, oblačno shranjevanje, multiplayer.
+Primer iz prakse: Resident Evil Requiem Demo ima 15,7 GB `.pak` datotek na
+NVMe disku, ki jih bere in riše tvoj računalnik — enako kot na Windowsih.
+Pravi *cloud gaming* (GeForce Now, Xbox Cloud) je nekaj drugega: tam slika
+pride po omrežju z drugega računalnika. WineForge tega ne počne.
+
+### Video: "Failed to create SourceReader with registered byte stream handler"
+Igra zažene, pokaže Capcom/EA/Unreal logo, nato skoči okno **Aborted** ali pa se
+preprosto zapre,
+v dnevniku pa: `winegstreamer error: decodebin0: Your GStreamer installation
+is missing a plug-in` in `err:mfplat:stream_handler_BeginCreateObject`.
+
+Winejev Media Foundation (video v igrah in programih) deluje prek
+**GStreamerja** gostitelja. Že en manjkajoč vmesnik (`qtdemux` za MP4) zadostuje, da
+celotne video verige ni mogoče sestaviti — igra dobi `E_FAIL` in prekine. Preveri in popravi:
+
+```bash
+./bin/wineforge media           # kaj manjka
+./bin/wineforge media --fix     # prenese manjkajoče pluginje (brez roota)
+```
+
+`--fix` prenese pluginje **iste različice** kot je sistemski GStreamer (ABI)
+in jih shrani v `engine/tools/gstreamer`, `wine_env` pa zanje nastavi
+`GST_PLUGIN_PATH`. Ker so v mapi motorja, potujejo z njim tudi na druge
+računalnike in na USB ključek. Preverjeno: po `media --fix` je MP4 predvajanje skozi
+`decodebin` uspelo, Resident Evil Requiem Demo pa je prvič prišel čez uvodni
+posnetek v meni.
+
+Če uporabljaš Proton/GE neposredno (npr. Epicov Linux launcher z GE-Proton),
+je isti problem druge narave: GE ima **svoje** GStreamer pluginje, ti pa so na
+Archem prestari — `libgstlibav.so` rabi `libvpx.so.6`, katerega v paketu
+ni več, zato se FFmpeg dekoder ne naloži. Popravek: v `files/lib/x86_64-linux-gnu`
+protonove mape položi `libvpx.so.6` (npr. iz Debiana 11). Potem video deluje.
+
+### Igre s CD/DVD ali ISO slike
+
+```bash
+./bin/wineforge disc                       # kaj je v pogonu + najdeni installerji
+./bin/wineforge disc --iso ~/igre/igra.iso # naloži sliko (zanka, brez roota)
+./bin/wineforge disc --install --name igra # namesti in naredi prenosno aplikacijo
+./bin/wineforge disc --link <prefix>       # poveži disk v obstoječ prefix
+./bin/wineforge disc --eject               # odmontiraj in sprosti zanko
+```
+
+Kaj se zgodi: `udisks2` naredi zanko in montažo (to sme tudi navaden uporabnik,
+root ni potreben), Wine pa samodejno dobi pogon (npr. `F:`) s pravilnim tipom —
+`dir f:` v Wineu izpiše `Nosilec v pogonu f je CDROM` vključno s serijsko
+številko nosilca. Diski se povežejo v vsak prefix samodejno (`link_discs`),
+`autorun.inf` se razčleni, `setup.exe` / `install.msi` pa se ponudi v namestitev.
+
+Omejitve (niso posledica motorja, ampak Winea):
+
+* **zaščita nosilcev**: SafeDisc, SecuROM, Laserlight in starejši StarForce so
+  *kernelni gonilniki* — pod Wine ne delujejo nikoli. Za takšne igre je edina
+  pot digitalna kopija (GOG/Steam) ali pa pravi Windows.
+* CD-Audio sledi na glasbenem CD-ju (`audio01.cda`) Wine ne zna predvajati
+  (podatkovni CD-ji z datotekami so brez težav).
+* Windows samodejni zagon (`autoplay`) ni podprt; installer zažene `disc
+  --install` ali ročno.
+
+### Kaj novejše igre potrebujejo (in kaj je že tu)
+
+| Potreba | Kaj je to | Stanje v WineForge |
+|---|---|---|
+| DXVK (D3D9/10/11) | prevaja Direct3D v Vulkan | v predlogi prefixa |
+| VKD3D-Proton (D3D12) | D3D12 → Vulkan | v predlogi prefixa |
+| DXVK-NVAPI | DLSS, Frame Generation, Reflex, RT detekcija | samodejno ob ustvarjanju prefixa |
+| Media Foundation | uvodni videi, predvajalniki | `media --fix` (vgrajeni plugini) |
+| VC++ 2005–2022 | skoraj vsaka igra | v predlogi prefixa |
+| .NET FW 4.8 / .NET 8 | launcherji, orodja | v predlogi prefixa |
+| DirectStorage | hitrejše nalaganje (RTX IO) | Wine še nima — igre same padejo na navadno branje datotek (deluje, le nalaganje je malo daljše) |
+| DirectPlay | stare LAN igre (Diablo II, StarCraft) | `dpnet`/`dplayx` vgrajena v Wine |
+| XAudio2/XInput | zvok in gamepad | v predlogi prefixa |
+| CUDA/NVENC/NVML | CUDA pospešek, kodiranje | `engine/nvidia-libs` |
+
+### Kaj pod Wine ne bo delalo (tudi ne v Bottlih ali Protonu)
+
+* **Jedrski anti-cheat**: Easy Anti-Cheat, BattlEye, Riot Vanguard, FACEIT —
+  zahtevajo Windows gonilnik, zato teh iger ni mogoče igrati (tudi ne v
+  Protonu/Bottlih). Seznam delujočih: [ProtonDB](https://www.protondb.com) in
+  [WineHQ AppDB](https://appdb.winehq.org).
+* **Windows storitve in PowerShell**: programi, ki med namestitvijo speljejo
+  storitev ali poganjajo PowerShell skripte (npr. StarDesk, nekateri VPN-i).
+* **WebView2 okna** (Epic Launcher 2.x, novi Outlook, Teams) — Wine bug 59370.
+* **Stare DOS in 3dfx/glide igre ter programi za Windows 3.1**: zanje so
+  boljši DOSBox Staging, PCjs ali GOG, ne Wine.
+
+### Kako se to primerja s Protonom in Bottles
+
+| | Proton (Steam) | Bottles | WineForge |
+|---|---|---|---|
+| DirectX → Vulkan | DA (DXVK/VKD3D) | DA (izbereš verzijo) | DA (v predlogi) |
+| GStreamer za video | vgrajen v Proton | **običajno ga ni** — rabiš sistemske pakete ali `BOTTLES_USE_SYSTEM_GSTREAMER=1` | vgrajen v motor (`media --fix`) |
+| DXVK-NVAPI (DLSS) | DA | DA (z NVIDIA runnerjem) | DA (samodejno) |
+| Popravki per-igra (`protonfixes`) | DA | delno (dependencies) | ne — namesto tega `doctor --fix` in `deps` |
+| Igra iz diskov | da (Steam) | ročno | `disc --iso` / pravi pogon |
+| Potrebuje launcher/račun | DA (Steam) | DA (Flatpak) | ne — samo mapa |
+
+Bottles sam o tem pravi v svojem FAQ: *"Classic Wine, Caffe, Soda, Vaniglia and
+most of the Wine versions do not ship any GStreamer plugins ... if a GStreamer
+installation is not found on your system, videos won't play."* Pri njih je to
+ročno delo (namesti sistemske pakete in nastavi spremenljivko okolja); pri
+WineForge to uredi `wineforge media --fix`, plugini pa potujejo z motorjem.
 
 ## Prenosnost
 
