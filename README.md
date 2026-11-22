@@ -80,6 +80,7 @@ odpre okno. Nič ročnega pisanja v terminal.
 | `disc` | igre s CD/DVD ali ISO: `--iso`, `--install`, `--link`, `--eject` |
 | `media` | preveri/dopolni predvajanje videa v igrah (`--fix`, brez roota) |
 | `sim` | skrbniške pravice + windows storitev + identiteta (`--verify`, `--win`, `--pin`) |
+| `pad` | navidezni Xbox_ročko za igre (`--start`, `--press`, `--axis`, `--dpad`, `--seq`) |
 | `deps` | iz PE uvozov ugotovi, katere komponente program potrebuje |
 | `bake` | zgradi/posodobi predlogo prefixa; `--compact` varčuje ~150 MB |
 | `prefix` | `list`, `new`, `delete`, `shell`, `explorer`, `tweaks` |
@@ -319,6 +320,51 @@ register, licenčni identifikatorji) je pod Wineom izenačen ali celo boljši;
 v jedru, je edina zdrava pot linuxni ustreznik — za predvajanje zaslona z
 igralno tipkovnico sta to **Sunshine + Moonlight** (uinput, vkms, zvočna zanka)
 ali **RustDesk**, za deljenje USB naprav pa `usbip`.
+
+## Navidezni gamepad (`pad`) — ustreznik `ViGEmBus.sys`
+
+Tisto zgoraj ni prazna obljuba: **Linux ima za windowske jedrske gonilnike
+navideznih naprav svoj ustreznik**, in Wine ga pokaže windowski igri kot pravo
+napravo. `wineforge pad` naredi raven `Xbox 360` gamepad v **Linuxovem jedru**
+(`/dev/uinput`) — brez roota, brez windowskega kernela, brez virtualnega
+računalnika in brez izgube hitrosti (gre za navadni jedrski vhod).
+
+```bash
+wineforge pad --start            # ustvari napravo + daemon
+wineforge pad --press a          # na voljo: A, B, X, Y, LB, RB, LT, RT,
+                                 #   back, start, guide, lstick, rstick
+wineforge pad --axis lx 0.9      # lx ly rx ry (od -1 do 1), lt rt (0..1)
+wineforge pad --dpad desno       # desno levo gor dol none
+wineforge pad --seq "a:0.2:600,b:0.2:600,start"   # niz (gumb:pritisk:pavza_ms)
+wineforge pad --stop
+```
+
+Izmerjeno na tem sistemu (22. 11. 2026):
+
+| preizkus | rezultat |
+|---|---|
+| naprava v jedru | `Name="WineForge Virtual Pad"`, `Bus=0003 Vendor=045e Product=028e` (Microsoft Xbox 360), vozlišči `event20 js0` |
+| pravice do naprave | udev sam postavi ACL `user:vidov:rw-` na `/dev/input/js0` → ** Wine jo lahko bere brez roota in brez skupine `input` ** |
+| `joy.cpl` pod Wineom | zavihek _Input_: »Connected (Input devices): **Controller (XBox 360 for Windows)**« |
+| windows klic `XInputGetState` | `kontrolnik 0: POVEZAN`, nato živo: `gumbi=A`, `B`, `X`, `START`, `DPAD_RIGHT`, `LSTICK=(29490,26212)` |
+To je torej ista funkcija, kot jo ima `ViGEmBus.sys` (za kar ga potrebujejo
+remote-play programi), samo na pravi strani. Uporabno je tudi za igre brez
+ročke, za samodejne nize v menijih in za testiranje vhodov.
+
+Opomba: `ly`/`ry` se vpišeta z obrnjenim predznakom, ker ima Linux os Y obrnjeno
+glede na XInput — zato `--axis ly 0.8` v igri pomeni **gor**.
+
+Pogoji: naložen modul `uinput` (je, če obstaja `/dev/uinput`) in zapisljiv
+`/dev/uinput`. Če ju ni, poskusi `sudo modprobe uinput` (edini morebitni root
+korak; na tem sistemu ni bil potreben).
+
+### Drugačen Wine motor
+
+`wineforge` zna zagnati tudi kak drug prenosni Wine (npr. zakrpan build, staging):
+
+```bash
+WINEFORGE_ENGINE=$PWD/engine/alt/wine-dcomp ./bin/wineforge run igra
+```
 
 ## Prenosnost
 

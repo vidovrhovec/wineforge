@@ -12,6 +12,7 @@ zato motor deluje iz katerekoli lokacije, tudi z USB ključa.
 """
 
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -80,7 +81,8 @@ PRENOS NA DRUG RACUNALNIK
 
 FORGE = Path(os.environ.get("WINEFORGE_DIR") or Path(__file__).resolve().parent.parent)
 ENGINE = FORGE / "engine"
-WINE_DIR = ENGINE / "wine"
+# Drugacen Wine (npr. zakrpan build za DComp): WINEFORGE_ENGINE=/pot/do/wine
+WINE_DIR = Path(os.environ.get("WINEFORGE_ENGINE") or (ENGINE / "wine")).resolve()
 WINE = WINE_DIR / "bin" / "wine"
 WINESERVER = WINE_DIR / "bin" / "wineserver"
 WINEBOOT = WINE_DIR / "bin" / "wineboot"
@@ -3360,6 +3362,291 @@ def cmd_sim(args):
     return 0
 
 
+# ---------------------------------------------- navidezni gamepad (uinput) ----
+# Windows igre ne berejo tipk iz X11, ampak XInput/DirectInput, ki pod Wineom
+# prideta iz jedrnih vhodnih naprav (/dev/input). Tu torej NE posnemamo gumba:
+# naredimo pravo napravo v Linuxovem jedru (/dev/uinput, brez roota) in Wine jo
+# pokaže kot "Controller (XBox 360 for Windows)". To je linuxni ustreznik
+# windowskim gonilnikom tipa ViGEmBus — brez windowskega kernela in brez VM.
+
+UINPUT_DEV = "/dev/uinput"
+PAD_NAME = "WineForge Virtual Pad"
+PAD_SOCK = DATA / "pad.sock"
+PAD_PID = DATA / "pad.pid"
+
+UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_ABSBIT = 0x40045564, 0x40045565, 0x40045567
+UI_DEV_SETUP, UI_ABS_SETUP = 0x405C5503, 0x401C5504
+EV_SYN, EV_KEY, EV_ABS = 0x00, 0x01, 0x03
+
+PAD_BTN = {"a": 0x130, "b": 0x131, "x": 0x133, "y": 0x134, "lb": 0x135, "rb": 0x136,
+           "lt": 0x137, "rt": 0x138, "back": 0x139, "select": 0x139, "start": 0x13B,
+           "guide": 0x13C, "lstick": 0x13D, "rstick": 0x13E}
+PAD_ABS = {"lx": (0x00, -32768, 32767), "ly": (0x01, -32768, 32767),
+           "rx": (0x03, -32768, 32767), "ry": (0x04, -32768, 32767),
+           "lt": (0x02, 0, 255), "rt": (0x05, 0, 255),
+           "dpadx": (0x10, -1, 1), "dpady": (0x11, -1, 1)}
+PAD_DPAD = {"desno": (1, 0), "levo": (-1, 0), "gor": (0, -1), "dol": (0, 1),
+            "none": (0, 0)}
+
+
+class VirtualPad:
+    """Prava vhodna naprava v jedru (Xbox 360 layout) prek /dev/uinput."""
+
+    def __init__(self, name=PAD_NAME):
+        import fcntl
+        self.fcntl = fcntl
+        self.name = name
+        self.fd = os.open(UINPUT_DEV, os.O_WRONLY | os.O_NONBLOCK)
+
+    def create(self):
+        for ev, klici in ((EV_KEY, sorted(set(PAD_BTN.values()))),
+                          (EV_ABS, sorted(set(c for c, _, _ in PAD_ABS.values())))):
+            fcntl = self.fcntl
+            fcntl.ioctl(self.fd, UI_SET_EVBIT, ev)
+            for k in klici:
+                fcntl.ioctl(self.fd, UI_SET_KEYBIT if ev == EV_KEY else UI_SET_ABSBIT, k)
+        fcntl.ioctl(self.fd, UI_DEV_SETUP,
+                    struct.pack("HHHH80sI", 0x03, 0x045E, 0x028E, 0x0110,
+                                self.name.encode(), 0))
+        for _, (code, mn, mx) in sorted(PAD_ABS.items()):
+            fcntl.ioctl(self.fd, UI_ABS_SETUP, struct.pack("HHiiiiii", code, 0, 0, mn, mx, 0, 0, 0))
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        time.sleep(0.8)
+
+    def _ev(self, typ, code, value):
+        ns = time.time_ns()
+        tv = struct.pack("qq", ns // 1_000_000_000, (ns % 1_000_000_000) * 1000)
+        os.write(self.fd, tv + struct.pack("HHi", typ, code, value))
+
+    def key(self, button, down):
+        self._ev(EV_KEY, PAD_BTN[button.lower()], 1 if down else 0)
+        self._ev(EV_SYN, 0, 0)
+
+    def tap(self, button, hold=0.2):
+        self.key(button, True)
+        time.sleep(hold)
+        self.key(button, False)
+
+    def axis(self, name, value):
+        code, mn, mx = PAD_ABS[name.lower()]
+        if name.lower() in ("lt", "rt"):
+            v = int(max(0.0, min(1.0, float(value))) * 255)
+        elif name.lower().startswith("dpad"):
+            v = max(-1, min(1, int(float(value))))
+        else:
+            v = int(max(-1.0, min(1.0, float(value))) * 32767)
+            if name.lower() in ("ly", "ry"):
+                v = -v          # Linux ima Y obrnjen glede na XInput
+        self._ev(EV_ABS, code, v)
+        self._ev(EV_SYN, 0, 0)
+
+    def dpad(self, smer):
+        x, y = PAD_DPAD[smer.lower()]
+        self.axis("dpadx", x)
+        self.axis("dpady", y)
+
+    def close(self):
+        try:
+            self.fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        except OSError:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+def pad_kernel():
+    """Je nasa naprava ze v jedru? vrne (ime, handlerji) ali None."""
+    try:
+        txt = Path("/proc/bus/input/devices").read_text()
+    except OSError:
+        return None
+    for blok in txt.split("\n\n"):
+        if PAD_NAME.lower() in blok.lower() or "wineforge" in blok.lower():
+            handlers = ""
+            for line in blok.splitlines():
+                if line.startswith("H: Handlers="):
+                    handlers = line.split("=", 1)[1].strip()
+            return handlers
+    return None
+
+
+def pad_pids():
+    if not PAD_PID.exists():
+        return []
+    try:
+        pid = int(PAD_PID.read_text().strip())
+    except ValueError:
+        return []
+    return [pid] if Path(f"/proc/{pid}").exists() else []
+
+
+def pad_send(cmd):
+    """Poslje ukaz zagnanemu pad daemonu."""
+    import socket
+    if not PAD_SOCK.exists():
+        return False, "pad ni zagnan (wineforge pad --start)"
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(6)
+        s.connect(str(PAD_SOCK))
+        s.sendall((cmd + "\n").encode())
+        odg = s.recv(200).decode(errors="replace").strip()
+        s.close()
+        return True, odg
+    except OSError as e:
+        return False, str(e)
+
+
+def pad_daemon(name=PAD_NAME):
+    """Ostané ziv in drzi napravo; sprejema ukaze po UNIX vticnici."""
+    import socket
+    if PAD_SOCK.exists():
+        try:
+            st = PAD_SOCK.stat()
+            if st.st_uid != os.getuid():
+                PAD_SOCK.unlink()
+            else:
+                pad_send("ping")
+        except OSError:
+            PAD_SOCK.unlink()
+    pad = VirtualPad(name)
+    pad.create()
+    PAD_PID.write_text(str(os.getpid()))
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(PAD_SOCK))
+    os.chmod(PAD_SOCK, 0o600)
+    srv.listen(4)
+    zadnji = time.time()
+    while True:
+        srv.settimeout(30)
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            if not pad_pids_ok():
+                break
+            continue
+        try:
+            ukaz = conn.recv(200).decode(errors="replace").strip()
+        except OSError:
+            continue
+        with contextlib.suppress(OSError):
+            conn.sendall(b"ok\n")
+        conn.close()
+        zadnji = time.time()
+        if ukaz == "quit":
+            break
+        deli = ukaz.split()
+        try:
+            if deli[0] == "press" and deli[1].lower() in PAD_BTN:
+                pad.tap(deli[1], float(deli[2]) if len(deli) > 2 else 0.2)
+            elif deli[0] == "down" and deli[1].lower() in PAD_BTN:
+                pad.key(deli[1], True)
+            elif deli[0] == "up" and deli[1].lower() in PAD_BTN:
+                pad.key(deli[1], False)
+            elif deli[0] == "axis" and deli[1].lower() in PAD_ABS:
+                pad.axis(deli[1], float(deli[2]))
+            elif deli[0] == "dpad" and deli[1].lower() in PAD_DPAD:
+                pad.dpad(deli[1])
+            elif deli[0] == "seq":
+                # seq A:0.2:400,B:0.2:200  -> pritisni, drzi, pauza (ms)
+                for korak in ",".join(deli[1:]).split(","):
+                    d = korak.split(":")
+                    pad.tap(d[0], float(d[1]) if len(d) > 1 else 0.2)
+                    time.sleep((float(d[2]) if len(d) > 2 else 300) / 1000.0)
+        except (IndexError, ValueError):
+            pass
+    pad.close()
+    with contextlib.suppress(OSError):
+        PAD_SOCK.unlink()
+        PAD_PID.unlink()
+    return 0
+
+
+def pad_pids_ok():
+    """Daemon ugasne, ce mu pid datoteka ne vec ne pripada (npr. znosen brisanje)."""
+    if not PAD_PID.exists():
+        return False
+    try:
+        return int(PAD_PID.read_text().strip()) == os.getpid()
+    except ValueError:
+        return False
+
+
+def cmd_pad(args):
+    """Navidezni Xbox_ročko za windowske igre pod Wine (brez roota)."""
+    if args.daemon:
+        return pad_daemon(args.name or PAD_NAME)
+    zivi = bool(pad_pids())
+    if args.start:
+        if zivi:
+            log("pad ze tece")
+        else:
+            LOGS.mkdir(parents=True, exist_ok=True)
+            with open(LOGS / "pad.log", "a") as f:
+                subprocess.Popen([sys.executable, str(FORGE / "bin" / "wineforge"), "pad", "--daemon"],
+                                 stdout=f, stderr=subprocess.STDOUT, start_new_session=True,
+                                 cwd=str(FORGE))
+            for _ in range(15):
+                time.sleep(0.7)
+                if pad_kernel():
+                    break
+        roko = pad_kernel()
+        if roko:
+            log(f"naprava v jedru: {PAD_NAME}  (vozlisci: {roko})")
+            log("Wine jo pokaže kot »Controller (XBox 360 for Windows)«")
+        else:
+            die("naprave ni bilo mogoče ustvariti — preveri, da je modul uinput naložen "
+                "in da je /dev/uinput zapisljiv")
+        return 0
+    if args.stop:
+        ok, odg = pad_send("quit")
+        for pid in pad_pids():
+            with contextlib.suppress(OSError):
+                os.kill(pid, 15)
+        with contextlib.suppress(OSError):
+            PAD_SOCK.unlink()
+            PAD_PID.unlink()
+        log("zaustavljeno")
+        return 0
+    if args.press:
+        ok, odg = pad_send("press " + args.press + (f" {args.hold}" if args.hold else ""))
+        print(("pritisnjen " + args.press) if ok else odg)
+        return 0 if ok else 1
+    if args.axis:
+        ok, odg = pad_send("axis " + args.axis[0] + " " + args.axis[1])
+        print(("os " + " ".join(args.axis)) if ok else odg)
+        return 0 if ok else 1
+    if args.dpad:
+        ok, odg = pad_send("dpad " + args.dpad)
+        print(("dpad " + args.dpad) if ok else odg)
+        return 0 if ok else 1
+    if args.seq:
+        ok, odg = pad_send("seq " + args.seq)
+        print("niz poslán" if ok else odg)
+        return 0 if ok else 1
+    if args.demo:
+        for g in ("a", "b", "x", "y", "start"):
+            pad_send(f"press {g}")
+            time.sleep(0.35)
+        for v in ("0.9", "-0.9", "0"):
+            pad_send("axis lx " + v)
+            time.sleep(0.25)
+        log("demo poslán (preveri joy.cpl v Wineu)")
+        return 0
+    # privzeto: stanje
+    log(f"uinput: {'obstaja' if Path(UINPUT_DEV).exists() else 'MANJKA (/dev/uinput)'}")
+    roko = pad_kernel()
+    log("naprava v jedru: " + (roko if roko else "ne"))
+    log("daemon: " + ("tece (pid " + str(pad_pids()[0]) + ")" if pad_pids() else "ne tece"))
+    if pad_pids() and roko:
+        ok, izpis = pad_send("ping")
+    log("uporaba: wineforge pad --start, nato --press a | --axis lx 0.9 | --dpad desno | --seq a,b:0.2:600")
+    return 0
+
+
 # ------------------------------------------------------------------- GUI ----
 
 def _dialog():
@@ -4122,6 +4409,20 @@ def build_parser():
     s.add_argument("--pin", action="store_true",
                    help="utrdi identiteto stroja (MachineGuid, HwProfileGuid, InstallDate)")
     s.set_defaults(func=cmd_sim)
+
+    s = sub.add_parser("pad", help="navidezni Xbox_ročko za igre (uinput, brez roota)")
+    s.add_argument("--start", action="store_true", help="ustvari napravo in zagni daemon")
+    s.add_argument("--stop", action="store_true", help="ustavi daemona in odstrani napravo")
+    s.add_argument("--daemon", action="store_true", help="notranji: drzi napravo (ne rabiš)")
+    s.add_argument("--name", metavar="IME", help="ime naprave, kot ga vidi igra")
+    s.add_argument("--press", metavar="GUMB", help="prekratko pritisni gumb (a b x y lb rb start back guide ...)")
+    s.add_argument("--hold", metavar="S", help="dolžina pritiska v sekundah")
+    s.add_argument("--axis", nargs=2, metavar=("OS", "VREDNOST"),
+                   help="premakni os (lx ly rx ry lt rt) na vrednost od -1 do 1")
+    s.add_argument("--dpad", metavar="DESNO|LEVO|GOR|DOL|none", help="premakni navzkrižni gumb")
+    s.add_argument("--seq", metavar="NIZ", help="niz: a:0.2:400,b:0.2:200 (gumb:pritisk:pavza_ms)")
+    s.add_argument("--demo", action="store_true", help="pošlji nekaj vnosov za preizkus")
+    s.set_defaults(func=cmd_pad)
 
     return p
 
