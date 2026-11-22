@@ -430,6 +430,68 @@ WINEPREFIX=$PWD/prefixes/<igor> engine/wine/bin/wine \
   /reference:System.Drawing.dll Z:\\tmp\\dprobe.exe
 ```
 
+## Zakaj StarDesk klient še vedno ne odpre (izmerjeno 22. 11. 2026)
+
+Klient (`bin\StarDesk.exe`) se konča s kodo **255** v ~2 s, brez okna in brez
+zrušitve. Tokrat smo ga ujeli na delu:
+
+1. **Navidezni zaslon ni bil ovira.** Z `wineforge display` smo naredili 1920×1080
+   zaslon in vanj poslali klient (`DISPLAY=:7`). `winex11.drv` se naloži (torej X
+   povezava je uspešna), a se klient vseeno konča s 255 → risba ni vzrok.
+2. **WebView2 runtime je nameščen** (ga je namestil sam instalator:
+   `C:\Program Files (x86)\Microsoft\EdgeWebView\Application\157.0.4341.60`, 692 MB);
+   `WebView2Loader.dll` se naloži, a se `msedgewebview2.exe` nikoli ne zažene →
+   klient umre **pred** UI-jem.
+3. **Ni manjkajočega API-ja.** Klient statically uvaža 3569 funkcij iz 49 DLL-jev;
+   od `wtsapi32` hoče `WTSQueryUserToken`, `WTSEnumerateSessionsW`,
+   `WTSQuerySessionInformationW`, `WTSRegisterSessionNotification` — **v Wine 11.22
+   jih ima vseh 6** (egzportov je 52); `userenv` (`LoadUserProfileW`,
+   `CreateEnvironmentBlock`), `netapi32` in `setupapi` (poizvedba po gonilnikih) so
+   prav tako prisotni.
+4. **Pravi zadnji korak je SSPI/LSA.** Sled (+file) pokaže, da je zadnje pred
+   izhodom odpiranje `\\.\pipe\lrpc\lsasspirpc` (Wineova cev do `lsass`), tik
+   prej se naložita `Kerberos.dll` in `MSV1_0.dll`. Lastna sonda
+   (`scripts/probe-sspi.cs`) v istem prefixu izmeri:
+
+   | klic | rezultat |
+   |---|---|
+   | `\\.\pipe\lrpc\lsasspirpc` | **odprta** (LSA je dosegljiva) |
+   | `AcquireCredentialsHandle("Negotiate"/"NTLM"/"Schannel")` | `S_OK` |
+   | `AcquireCredentialsHandle("Kerberos")` | `0x8009030E` **SEC_E_NO_CREDENTIALS** |
+   | `AcquireCredentialsHandle("MSV1_0"/"CredSSP")` | `0x80090305` **SEC_E_SECPKG_NOT_FOUND** |
+   | `InitializeSecurityContext("Negotiate"/"NTLM", "localhost")` | `0x80090301` **SEC_E_INVALID_HANDLE** |
+
+   Po Wineovi plati torej **klic na SSPI ne more začeti varne seje**: Kerberos nima
+   poverilnic (ni domene/prijave), MSV1_0 in CredSSP kot paketa v Wineovem LSA
+   sploh nista registrirana. To je tudi razlog, da `PsExec -s` prej ni mogel
+   zapisati svojega ključa (`Neveljaven ročnik`).
+
+Poleg tega ostaja jedrni del (brez tega StarDesk na Windowsih ne deluje normalno):
+`sdvhid.sys`, `ViGEmBus.sys`, `SDIddDriver` (IddCx), `SDUSB(.Mon).sys` — Wine nima
+jedra in jih ne more naložiti. Za dva od njiju ima WineForge že **nativna
+ustreznika**: `wineforge pad` (uinput namesto ViGEmBus/sdvhid) in
+`wineforge display` (namesto IddCx).
+
+Kaj bi še lahko poskusili (vrstni red po smislu):
+
+1. **Nadomestna SSPI knjižnica** — lasten `secur32.dll` kot proxy, ki za pakete
+   Negotiate/NTLM/Kerberos vrne samoskladno lažno lokalno avtentikacijo (storitev
+   in klient sta v istem prefixu, se torej vidita). Delno delo je veliko,
+   uspeh ni gotov; ta sistem poleg tega **nima prekriznega prevajalnika**
+   (`x86_64-w64-mingw32-gcc` / `clang` nista nameščena) — rabili bi prenosni
+   `llvm-mingw`.
+2. **Pravi Windows v virtualnem racunalniku** — edina pot, ki res dobi jedro,
+   gonilnike, UAC, SSPI in delujoč WebView2 hkrati. `/dev/kvm` je na voljo in
+   procesor podpira VT-x; manjka še QEMU in Windows ISO.
+
+Sonde, s katerima se to ponovi:
+
+```bash
+wineforge sim <prefix> --verify          # pravice, storitve, identiteta
+wine 'C:\temp\sspi.exe'                   # scripts/probe-sspi.cs — kaj vrne SSPI
+wine 'C:\temp\wts.exe'                    # scripts/probe-wts.cs  — sej in WTS
+```
+
 ## Navidezni zaslon (`display`) — ustreznik `SDIddDriver` / IddCx
 
 Programi za predvajanje zaslona (StarDesk, Sunshine, Parsec) imajo na Windowsih
