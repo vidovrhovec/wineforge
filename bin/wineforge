@@ -542,6 +542,9 @@ def app_run(name, args=None, debug=False):
     cmd = [str(WINE), target] + list(args or [])
     if meta.get("args") and not args:
         cmd = [str(WINE), target] + list(meta["args"])
+    # simulirane windows storitve (brez teh nekateri programi ne tečejo)
+    for s in meta.get("services", []):
+        svc_ensure(prefix, s["name"], s["exe"], s.get("auto", True), args=s.get("args"))
     log(f"Zaganjam {meta['name']} (prefix: {prefix})")
     code, _ = run(cmd, env=wine_env(prefix, env, debug))
     return code
@@ -2765,6 +2768,325 @@ def cmd_desktop(args):
     return 0
 
 
+# ------------------------ simulacija pravic in windows storitev ("lažni") ----
+# Nekateri programi (StarDesk, orodja za overlay, protipetje ...) zahtevajo
+# skrbniške pravice in zagnano windows storitev. Wine nima UAC, ima pa pravi
+# SCM (upravitelj windows storitev): `sc create` dela, njegovi services.exe pa
+# registrirane storitve tudi sam zažene. WineForge to izkoristi: storitev
+# registrira v prefixu, jo po potrebi zažene sam in napiše v register, da
+# program vidi "skrbnik sem, UAC ne vpraša". Jedrskih gonilnikov to NE more
+# nadomestiti.
+
+SERVICES_KEY = r"HKLM\System\CurrentControlSet\Services"
+POLICY_KEY = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+ADMIN_VALUES = {"EnableLUA": "0", "ConsentPromptBehaviorAdmin": "0",
+                "ConsentPromptBehaviorUser": "0", "PromptOnSecureDesktop": "0"}
+
+
+def svc_key(name):
+    return f"{SERVICES_KEY}\\{name}"
+
+
+def reg_get(prefix, key, name):
+    """Vrednost registrske vrednosti kot niz (ali None)."""
+    code, out = wine(["reg", "query", key, "/v", name], prefix=prefix, capture=True)
+    if code != 0:
+        return None
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1].startswith("REG_") and parts[0].lower() == name.lower():
+            return " ".join(parts[3:]) if len(parts) > 3 else parts[-1]
+    return None
+
+
+def svc_list(prefix):
+    """Imena storitev, registriranih v SCM-ju prefixa."""
+    code, out = wine(["reg", "query", SERVICES_KEY], prefix=prefix, capture=True)
+    names = []
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if line.upper().startswith(SERVICES_KEY.upper() + "\\"):
+            names.append(line.split("\\")[-1])
+    return sorted(set(names))
+
+
+def svc_info(prefix, name):
+    """Vrednosti ključa storitve kot slovar (ali None, če storitve ni)."""
+    code, out = wine(["reg", "query", svc_key(name), "/s"], prefix=prefix, capture=True)
+    if code != 0:
+        return None
+    info = {}
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1].startswith("REG_"):
+            info[parts[0]] = " ".join(parts[3:]) or parts[2]
+    return info or None
+
+
+def svc_add(prefix, name, exe_win, auto=True):
+    """Registrira windows storitev v prefixu (enako kot `sc create`)."""
+    ok = True
+    ok &= reg_add(prefix, svc_key(name), "ImagePath", exe_win, "REG_EXPAND_SZ")
+    ok &= reg_add(prefix, svc_key(name), "Type", "16", "REG_DWORD")       # WIN32_OWN_PROCESS
+    ok &= reg_add(prefix, svc_key(name), "Start", "2" if auto else "3", "REG_DWORD")
+    ok &= reg_add(prefix, svc_key(name), "ErrorControl", "1", "REG_DWORD")
+    ok &= reg_add(prefix, svc_key(name), "ObjectName", "LocalSystem")
+    return bool(ok)
+
+
+def svc_remove(prefix, name):
+    wine(["reg", "delete", svc_key(name), "/f"], prefix=prefix, capture=True)
+
+
+def svc_state(prefix, name):
+    """(številka, beseda) iz `sc query`: 4 RUNNING, 1 STOPPED, (None,None) = ni registriran."""
+    code, out = wine(["sc", "query", name], prefix=prefix, capture=True)
+    for line in (out or "").splitlines():
+        if "STATE" not in line:
+            continue
+        for num, word in (("4", "RUNNING"), ("1", "STOPPED"), ("2", "START_PENDING"),
+                          ("3", "STOP_PENDING")):
+            if re.search(rf"\b{num}\s+{word}", line):
+                return num, word
+    return None, None
+
+
+def proc_pids(needle, prefix=None):
+    """Pid-i zagnanih procesov po imenu binarke (lastni procesi, po želji v našem prefixu)."""
+    base = re.split(r"[\\/]", str(needle))[-1].lower()   # windows poti Linux ne razume
+    if base.endswith(".exe"):
+        base = base[:-4]
+    base = base[:14]
+    want = ("WINEPREFIX=" + str(prefix)).encode() if prefix else None
+    out = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            comm = (d / "comm").read_text().strip().lower()
+            if base and not comm.startswith(base):
+                continue
+            if want and want not in (d / "environ").read_bytes().split(b"\0"):
+                continue
+        except OSError:
+            continue
+        out.append(int(d.name))
+    return out
+
+
+def svc_spawn(prefix, name, exe_win, args=None):
+    """Zažene storitev kot navaden proces — simulacija SCM zagona."""
+    LOGS.mkdir(parents=True, exist_ok=True)
+    f = open(LOGS / f"storitev-{slugify(name)}.log", "a")
+    env = wine_env(prefix, {"WINEDEBUG": "-all"})
+    env["WINEFORGE_SVC"] = name
+    subprocess.Popen([str(WINE), exe_win] + list(args or []), env=env,
+                     stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def svc_stop(prefix, name, exe_win=None):
+    for pid in proc_pids(exe_win or name, prefix):
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+    wine(["sc", "stop", name], prefix=prefix, capture=True)
+
+
+def svc_ensure(prefix, name, exe_win, auto=True, wait=8, args=None):
+    """Poskrbi, da storitev obstaja v SCM in da ji proces tece."""
+    if not svc_info(prefix, name):
+        svc_add(prefix, name, exe_win, auto)
+        log(f"    storitev '{name}' registrirana v SCM ({exe_win})")
+    num, word = svc_state(prefix, name)
+    if word == "RUNNING" or proc_pids(exe_win, prefix):
+        return True
+    # services.exe jih zažene le ob zagonu wineservera in zna le tiste, ki se
+    # javijo SCM-ju — če ne, zažene proces sam
+    svc_spawn(prefix, name, exe_win, args)
+    for _ in range(wait):
+        time.sleep(1)
+        if proc_pids(exe_win, prefix):
+            log(f"    storitev '{name}' teče (simulirano)")
+            return True
+    warn(f"    storitve '{name}' ni bilo mogoče zagnati")
+    return False
+
+
+SVC_NAME_HINT = re.compile(r"(service|daemon|_svc|srv)", re.I)
+SVC_SKIP_PATHS = ("edgecore", "microsoft\\edge", "windowsapps", "microsoft shared",
+                  "dotnet", "microsoft.net\\framework")
+SVC_SKIP_NAMES = ("psexec", "cmd", "powershell", "rundll", "mshta", "regsvr32",
+                  "installutil", "js",
+                  "cscript", "wscript")
+
+
+def svc_candidates(prefix, limit=8, max_files=400):
+    """Binarke v prefixu, ki se javijo SCM-ju (prave windows storitve).
+
+    Vrne seznam z `likely=True` za tiste, ki jih je smiselno samodejno
+    registrirati (ime se glasi kot storitev), in `likely=False` za sumljive.
+    """
+    markers = (b"StartServiceCtrlDispatcherW", b"RegisterServiceCtrlHandlerW",
+               b"RegisterServiceCtrlHandlerExW")
+    dc = prefix / "drive_c"
+    seen = 0
+    cands = []
+    for root in ("Program Files", "Program Files (x86)"):
+        base = dc / root
+        if not base.is_dir():
+            continue
+        for f in sorted(base.rglob("*.exe")):
+            if len(f.relative_to(base).parts) > 4:
+                continue
+            n = f.name.lower()
+            if any(k in n for k in ("uninstall", "deinstall", "crashpad", "crashreport",
+                                    "reporter", "updater", "setup")):
+                continue
+            if any(k in str(f).lower() for k in SVC_SKIP_PATHS):
+                continue
+            if any(k == n.split(".")[0] for k in SVC_SKIP_NAMES):
+                continue
+            cands.append(f)
+    # napisi "...service.exe" so najverjetnejši — najprej na vrsto
+    cands.sort(key=lambda f: ("service" not in f.name.lower(), len(str(f))))
+    found, by_name = [], {}
+    for f in cands:
+        if len(by_name) >= limit or seen >= max_files:
+            break
+        seen += 1
+        try:
+            if f.stat().st_size > 120 * 1024 * 1024:
+                continue
+            data = f.read_bytes()
+        except OSError:
+            continue
+        if not any(m in data for m in markers):
+            continue
+        name = f.stem
+        if name in by_name:      # isti program je v dveh mapah
+            continue
+        rel = f.relative_to(dc)
+        item = {"name": name, "exe": "C:\\" + str(rel).replace("/", "\\"),
+                "likely": bool(SVC_NAME_HINT.search(name))}
+        by_name[name] = item
+        found.append(item)
+    return found
+
+
+def admin_sim(prefix, on=True):
+    """V register napiše, da program vidi: skrbnik sem, UAC naj ne vpraša."""
+    if on:
+        for k, v in ADMIN_VALUES.items():
+            reg_add(prefix, POLICY_KEY, k, v, "REG_DWORD")
+        return True
+    for k in ADMIN_VALUES:
+        reg_delete(prefix, POLICY_KEY, k)
+    return True
+
+
+def admin_state(prefix):
+    v = reg_get(prefix, POLICY_KEY, "EnableLUA")
+    if v is None:
+        return False
+    try:
+        return int(v, 0) == 0
+    except ValueError:
+        return False
+
+
+def sim_status(prefix, svcs):
+    lines = []
+    lines.append("  pravice: " + ("lažno povišanje nastavljeno (UAC izklopljen v registru)"
+                                  if admin_state(prefix) else
+                                  "privzete (Wine-ov uporabnik je skrbnik)"))
+    for s in svcs:
+        num, word = svc_state(prefix, s["name"])
+        pids = proc_pids(s["exe"], prefix)
+        stanje = word or "ni registrirana"
+        if pids and word != "RUNNING":
+            stanje = "RUNNING (simulirano)"
+        lines.append(f"  storitev {s['name']}: {stanje}"
+                     + (f", pid {' '.join(map(str, pids))}" if pids else "")
+                     + ("" if s.get("auto", True) else " [ročni zagon]"))
+    return "\n".join(lines)
+
+def cmd_sim(args):
+    """Programu predstavi, da je dobil skrbniške pravice in da njegova storitev teče."""
+    meta = app_load(args.name)
+    if not meta:
+        die(f"Aplikacija '{args.name}' ne obstaja. Uporabi: wineforge list")
+    prefix = prefix_path(meta.get("prefix") or args.name)
+    if not prefix.exists():
+        prefix = prepare_app_prefix(args.name)
+    svcs = list(meta.get("services", []))
+
+    for spec in args.svc or []:
+        svc_args = []
+        if "|" in spec:
+            spec, a = spec.split("|", 1)
+            svc_args = a.split()
+        if "=" in spec:
+            name, exe = spec.split("=", 1)
+        else:
+            exe = spec
+            name = re.split(r"[\\/]", spec)[-1]
+            name = name[:-4] if name.lower().endswith(".exe") else name
+        exe = exe.replace("/", "\\") if re.match(r"^[A-Za-z]:", exe) else wine_path(exe)
+        svcs = [s for s in svcs if s["name"] != name]
+        svcs.append({"name": name, "exe": exe, "auto": not args.manual, "args": svc_args})
+        svc_add(prefix, name, exe, not args.manual)
+        log(f"storitev '{name}' -> {exe} {' '.join(svc_args)}")
+
+    for n in args.rm or []:
+        svc_stop(prefix, n, next((s["exe"] for s in svcs if s["name"] == n), n))
+        svc_remove(prefix, n)
+        svcs = [s for s in svcs if s["name"] != n]
+        log(f"storitev '{n}' odstranjena")
+
+    if not svcs and not (args.svc or args.rm or args.status or args.stop):
+        kandi = svc_candidates(prefix)
+        if kandi:
+            log("Najdene programske storitve:")
+            for k in kandi:
+                if not k["likely"]:
+                    log(f"    morda {k['name']}  ({k['exe']}) — ce hoces: --svc \"{k['name']}={k['exe']}\"")
+                    continue
+                log(f"    {k['name']}  ({k['exe']})")
+                svc_add(prefix, k["name"], k["exe"], True)
+                svcs.append({"name": k["name"], "exe": k["exe"], "auto": True, "args": []})
+        else:
+            log("V prefixu ni bilo najdene programske storitve "
+                "(dodaj ročno: wineforge sim " + args.name + ' --svc "IME=C:\\pot\\x.exe")')
+
+    env = dict(meta.get("env") or {})
+    if args.admin:
+        admin_sim(prefix, True)
+        # za Wine gradnje, ki to podpirajo (nas 11.22 ignorira — ni skodov shimov)
+        env["__COMPAT_LAYER"] = "RunAsInvoker"
+        log("lažno povišanje vklopljeno")
+    if args.no_admin:
+        admin_sim(prefix, False)
+        env.pop("__COMPAT_LAYER", None)
+        log("lažno povišanje izklopljeno")
+    if env:
+        meta["env"] = env
+
+    meta["services"] = svcs
+    app_save(meta)
+
+    if svcs and not args.stop and not args.status:
+        log("Zagotavljam storitve:")
+        for s in svcs:
+            svc_ensure(prefix, s["name"], s["exe"], s.get("auto", True), args=s.get("args"))
+    if args.stop:
+        for s in svcs:
+            svc_stop(prefix, s["name"], s["exe"])
+        log("storitve ustavljene")
+    print(sim_status(prefix, svcs))
+    return 0
+
+
 # ------------------------------------------------------------------- GUI ----
 
 def _dialog():
@@ -2980,6 +3302,7 @@ def cmd_gui(args):
                           "Odpri dnevnike (napake pri namestitvi)",
                           "Namestuj igro s CD/DVD ali ISO slike",
                           "Dopolni predvajanje videa (igre z uvodnimi videi)",
+                          "Program naj misli, da je skrbnik (pravice + storitve)",
                           "Diagnoza (Wine, GPU, CUDA)",
                           "Zapri")
         if code != 0 or not choice.strip():
@@ -3089,6 +3412,13 @@ def cmd_gui(args):
                                          "Lahko traja nekaj minut.")
             m = re.search(r"dnevnik namestitve: (\S+)", out)
             _show("Namestitev z diska", out, log=m.group(1) if m else None)
+        elif c.startswith("Program naj misli"):
+            name = _app_menu("Skrbniške pravice in storitve")
+            if not name:
+                continue
+            code, out = _wf("sim", name,
+                            progress_msg=f"Urejam pravice in storitve za {name} ...")
+            _show("Pravice in storitve — " + name, out)
         elif c.startswith("Dopolni predvajanje"):
             code, out = _wf("media", "--fix",
                             progress_msg="Dopolnjujem predvajanje videa ...")
@@ -3499,6 +3829,20 @@ def build_parser():
     s.add_argument("--link", metavar="PREFIX", help="poveži diske v prefix kot pogone")
     s.add_argument("--eject", action="store_true", help="odmontiraj in sprosti diske")
     s.set_defaults(func=cmd_disc)
+
+    s = sub.add_parser("sim", help="programu daj skrbniške pravice in njegovo storitev (simulacija)")
+    s.add_argument("name", help="ime nameščenega programa")
+    s.add_argument("--svc", action="append", metavar="IME=C:\\pot\\Storitev.exe",
+                   help="registriraj/zaženi windows storitev programa")
+    s.add_argument("--rm", action="append", metavar="IME", help="odstrani simulirano storitev")
+    s.add_argument("--manual", action="store_true",
+                   help="storitev naj bo za zagon ročna (ne samodejno)")
+    s.add_argument("--admin", action="store_true",
+                   help="izklopi UAC v registru (program naj ne vpraša za pravice)")
+    s.add_argument("--no-admin", action="store_true", help="razveljavi lažno povišanje")
+    s.add_argument("--stop", action="store_true", help="ustavi simulirane storitve")
+    s.add_argument("--status", action="store_true", help="samo prikaži stanje")
+    s.set_defaults(func=cmd_sim)
 
     return p
 

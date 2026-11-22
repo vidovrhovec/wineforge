@@ -79,6 +79,7 @@ odpre okno. Nič ročnega pisanja v terminal.
 | `install` | zažene installer in iz njega naredi prenosno aplikacijo (`--no-shortcut`) |
 | `disc` | igre s CD/DVD ali ISO: `--iso`, `--install`, `--link`, `--eject` |
 | `media` | preveri/dopolni predvajanje videa v igrah (`--fix`, brez roota) |
+| `sim` | programu da skrbniške pravice in njegovo windows storitev (simulacija) |
 | `deps` | iz PE uvozov ugotovi, katere komponente program potrebuje |
 | `bake` | zgradi/posodobi predlogo prefixa; `--compact` varčuje ~150 MB |
 | `prefix` | `list`, `new`, `delete`, `shell`, `explorer`, `tweaks` |
@@ -202,6 +203,8 @@ Omejitve (niso posledica motorja, ampak Winea):
   [WineHQ AppDB](https://appdb.winehq.org).
 * **Windows storitve in PowerShell**: programi, ki med namestitvijo speljejo
   storitev ali poganjajo PowerShell skripte (npr. StarDesk, nekateri VPN-i).
+  Del storitve lahko **Simuliraš** (`wineforge sim <app>`, glej spodaj),
+  PowerShella pa Wine ne more nadomestiti.
 * **WebView2 okna** (Epic Launcher 2.x, novi Outlook, Teams) — Wine bug 59370.
 * **Stare DOS in 3dfx/glide igre ter programi za Windows 3.1**: zanje so
   boljši DOSBox Staging, PCjs ali GOG, ne Wine.
@@ -222,6 +225,60 @@ most of the Wine versions do not ship any GStreamer plugins ... if a GStreamer
 installation is not found on your system, videos won't play."* Pri njih je to
 ročno delo (namesti sistemske pakete in nastavi spremenljivko okolja); pri
 WineForge to uredi `wineforge media --fix`, plugini pa potujejo z motorjem.
+
+## Program, ki hoče skrbnika ali windows storitev
+
+Nekateri programi (StarDesk, overlay orodja, nekateri VPN-i, starejši
+glasbeni vmesniki) zaženejo še **windows storitev** in hočejo **skrbniške
+pravice**. Brez tega se pritožijo (`failed to open service 1060`) ali pa se
+sploh ne zaženejo.
+
+Wine na srečo **ima pravi SCM** (bazen windows storitev): `sc create` dela,
+njegov `services.exe` pa registrirane storitve zna tudi zagnati. Zato jih ni
+potrebno ponarediti v registru — samo registrirati jih je treba, ker installer
+teh korakov pod Wineom ne more opraviti do konca.
+
+```bash
+wineforge sim <ime>              # samodejno: najde storitve, jih registrira in zažene
+wineforge sim <ime> --status     # kaj je registrirano in kaj teče
+wineforge sim <ime> --stop       # ustavi simulirane storitve
+wineforge sim <ime> --no-admin   # razveljavi lažno povišanje
+
+# ročno, če samodejno iskanje ne zadene:
+wineforge sim <ime> --svc "MojaStoritev=C:\Program Files\Program\Storitev.exe"
+# z argumenti (loči z |):
+wineforge sim <ime> --svc "MojaStoritev=C:\...\Storitev.exe|--silent"
+```
+
+Samodejno registrira samo tiste binarke, ki se po imenu vedejo kot storitev
+(`*service*`, `*daemon*`); ostale samo našteje in predlaga ukaz zanje — tako
+se ne more zgoditi, da bi po nesreči zagnal `PsExec` ali kaj podobnega.
+
+Ukaz naredi tri stvari:
+
+1. **Pravice** — v registru nastavi skrbniške politike (`EnableLUA=0,
+   ConsentPromptBehaviorAdmin=0, ...`), da program ne čaka na potrditev UAC.
+   Wine ionako nima UAC in je tvoj windows uporabnik skrbnik, zato to
+   pogosto ni potrebno — a nekateri programi te vrednosti berejo.
+2. **Storitev** — napiše jo v `HKLM\System\CurrentControlSet\Services`
+   (isto kot `sc create`) in jo zažene; če se sama ne zna javiti SCM-ju, jo
+   WineForge drži kot navaden proces. Ko je enkrat vpisana, jo `wineforge run
+   <ime>` zažene sam pred vsakim zagonem programa.
+3. **Pogled** — pove, kaj je registrirano in kateri pid teče
+   (`wineforge sim <ime> --status`).
+
+### Česa ta simulacija NE more
+
+* **jedrskih gonilnikov** — anti-cheat (EAC, BattlEye, Vanguard), nekatere
+  zaščite pred kopiranjem in nekateri VPN-i gredo v jedro Windows; tega Wine
+  ne more ponarediti,
+* **jedrskih omrežnih filtrov** (= pravi požarni zid / preusmerjanje prometa),
+* **posebnih pravic, kot je `SeDebugPrivilege`** — brskanje po tujih procesih
+  (orodja za varnostne preiskave, cheat enginei).
+
+Skratka: **uporabniški del** (storitev + skrbnik) je izenačen, **jedrski del**
+ne more biti. Ker je razlog za vsak program drugačen, `doctor` in izpis
+`sim --status` pokažeta, do kod je prišlo.
 
 ## Prenosnost
 
